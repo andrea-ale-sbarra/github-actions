@@ -9,13 +9,41 @@ from typing import Optional
 
 BASE_URL = "https://testray.liferay.com/o/c"
 TESTRAY_REST_URL = "https://testray.liferay.com/o/testray-rest/v1.0"
-HEADLESS_ROUTINE_ID = 994140
+TESTRAY_UI_URL = "https://testray.liferay.com/web/testray"
+COMMERCE_ROUTINE_ID = 35394
+USER_MANAGEMENT_ROUTINE_ID = 1874638
 ACCEPTANCE_ROUTINE_ID = 590307
 STATUS_FAILED_BLOCKED_TESTFIX = "FAILED,TESTFIX,BLOCKED"
 
 
+def testray_build_url(build_id):
+    return f"{TESTRAY_UI_URL}#/builds/{build_id}"
+
+
+def testray_task_url(task_id):
+    return f"{TESTRAY_UI_URL}#/testflow/{task_id}"
+
+
+def testray_subtask_url(subtask_id, task_id=None):
+    if task_id:
+        return f"{TESTRAY_UI_URL}#/testflow/{task_id}/subtasks/{subtask_id}"
+    return f"{TESTRAY_UI_URL}#/subtasks/{subtask_id}"
+
+
+def testray_case_result_url(case_result_id):
+    return f"{TESTRAY_UI_URL}#/caseresults/{case_result_id}"
+
+
 def assign_issue_to_case_result_batch(batch_updates):
     """Update a batch of case results with issues and due statuses."""
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        print(f"[DRY RUN] Would assign issues to {len(batch_updates)} case results:")
+        for item in batch_updates:
+            print(
+                f"    - case result {item['id']} → issues={item.get('issues')} "
+                f"({testray_case_result_url(item['id'])})"
+            )
+        return
     for item in batch_updates:
         case_result_id = item["id"]
         payload = {"dueStatus": item["dueStatus"], "issues": item["issues"]}
@@ -25,13 +53,23 @@ def assign_issue_to_case_result_batch(batch_updates):
 
 def autofill_build(testray_build_id_1, testray_build_id_2):
     """Trigger autofill between two Testray builds."""
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        print(
+            f"[DRY RUN] Would autofill build {testray_build_id_2} "
+            f"({testray_build_url(testray_build_id_2)}) from {testray_build_id_1} "
+            f"({testray_build_url(testray_build_id_1)})"
+        )
+        return {}
     url = f"{TESTRAY_REST_URL}/testray-build-autofill/{testray_build_id_1}/{testray_build_id_2}"
     response = requests.post(url, headers=_get_headers(), data="")
-    response.raise_for_status()
+    _raise_for_status(response, f"autofilling build {testray_build_id_2} from {testray_build_id_1}")
     return response.json()
 
 
 def complete_task(task_id):
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        print(f"[DRY RUN] Would complete task {task_id} → {testray_task_url(task_id)}")
+        return {}
     url = f"{BASE_URL}/tasks/{task_id}"
     payload = {"dueStatus": {"key": "COMPLETE", "name": "Complete"}}
     response = requests.patch(
@@ -39,12 +77,18 @@ def complete_task(task_id):
         json=payload,
         headers={**_get_headers(), "Content-Type": "application/json"},
     )
-    response.raise_for_status()
+    _raise_for_status(response, f"completing task {task_id}")
     return response.json()
 
 
 def create_task(build):
     """Create a task for a build."""
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        print(
+            f"[DRY RUN] Would create task for build {build['id']} "
+            f"→ {testray_build_url(build['id'])}"
+        )
+        return {"id": "DRY-RUN-TASK-ID"}
     payload = {
         "name": build["name"],
         "r_buildToTasks_c_buildId": build["id"],
@@ -55,15 +99,21 @@ def create_task(build):
         json=payload,
         headers={**_get_headers(), "Content-Type": "application/json"},
     )
-    response.raise_for_status()
+    _raise_for_status(response, f"creating task for build {build['id']}")
     return response.json()
 
 
 def create_testflow(task_id):
     """Create testflow for a task."""
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        print(
+            f"[DRY RUN] Would create testflow for task {task_id} "
+            f"→ {testray_task_url(task_id)}"
+        )
+        return {}
     url = f"{TESTRAY_REST_URL}/testray-testflow/{task_id}"
     response = requests.post(url, headers=_get_headers(), data="")
-    response.raise_for_status()
+    _raise_for_status(response, f"creating testflow for task {task_id}")
     return response.json()
 
 
@@ -193,10 +243,32 @@ def get_component_name(component_id):
 
 
 def get_routine_to_builds(routine_id):
-    """Fetch all builds for a routine, remove pagination and sort by dateCreated descending."""
-    url = f"{BASE_URL}/routines/{routine_id}/routineToBuilds?fields=dueDate,name,id,importStatus,gitHash,r_routineToBuilds_c_routineId,dateCreated&pageSize=-1"
-    items = _get_json(url).get("items", [])
-    return sorted(items, key=lambda b: b.get("dateCreated", ""), reverse=True)
+    """Fetch all builds for a routine, sorted by dueDate descending.
+
+    Uses explicit pagination instead of pageSize=-1: the relation endpoint
+    has been observed silently capping the response at the default page when
+    pageSize=-1 is passed, which would let recently-imported builds slip past
+    the analyzer.
+
+    Sorting by dueDate (the build's scheduled run time) is more reliable than
+    dateCreated, which Testray sometimes leaves null on freshly imported
+    builds (sorting by null pushes the newest build to the bottom of the list).
+    """
+    page = 1
+    page_size = 200
+    all_items = []
+    while True:
+        url = (
+            f"{BASE_URL}/routines/{routine_id}/routineToBuilds"
+            f"?fields=dueDate,name,id,importStatus,gitHash,r_routineToBuilds_c_routineId,dateCreated"
+            f"&pageSize={page_size}&page={page}"
+        )
+        items = _get_json(url).get("items", [])
+        all_items.extend(items)
+        if len(items) < page_size:
+            break
+        page += 1
+    return sorted(all_items, key=lambda b: b.get("dueDate") or "", reverse=True)
 
 
 def get_build_sha(build_id):
@@ -238,6 +310,12 @@ def get_task_subtasks(task_id):
 
 
 def update_subtask_status(subtask_id: str, issues: Optional[str] = None) -> None:
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        print(
+            f"[DRY RUN] Would update subtask {subtask_id} status to COMPLETE "
+            f"(issues: {issues}) → {testray_subtask_url(subtask_id)}"
+        )
+        return
     """Mark a subtask as complete."""
     url = f"{BASE_URL}/subtasks/{subtask_id}"
     payload = {"dueStatus": {"key": "COMPLETE", "name": "Complete"}}
@@ -257,7 +335,7 @@ def _get_json(url, max_retries=3):
                 _get_headers.cache_clear()
                 response = requests.get(url, headers=_get_headers(), timeout=30)
 
-            response.raise_for_status()
+            _raise_for_status(response, f"GET {url}")
 
             return response.json()
 
@@ -284,8 +362,32 @@ def _put_json(url, payload):
         json=payload,
         headers={**_get_headers(), "Content-Type": "application/json"},
     )
-    response.raise_for_status()
+    _raise_for_status(response, f"PUT {url}")
     return response.json()
+
+
+def _raise_for_status(response, action):
+    """Raise HTTPError with clearer guidance for auth-related failures.
+
+    401 → token wrong/expired. 403 → token OK but client lacks permission.
+    Both are easy to confuse with bugs in the script, so make them obvious.
+    """
+    if response.status_code == 403:
+        raise requests.HTTPError(
+            f"403 Forbidden while {action}.\n"
+            f"  The OAuth2 client authenticated, but is not authorized for this endpoint.\n"
+            f"  Ask whoever provisioned TESTRAY_CLIENT_ID / TESTRAY_CLIENT_SECRET to grant\n"
+            f"  the required Testray role (typically 'Testray Users' membership or\n"
+            f"  equivalent permission on the testray-rest application).",
+            response=response,
+        )
+    if response.status_code == 401:
+        raise requests.HTTPError(
+            f"401 Unauthorized while {action}.\n"
+            f"  Verify TESTRAY_CLIENT_ID / TESTRAY_CLIENT_SECRET are correct and active.",
+            response=response,
+        )
+    response.raise_for_status()
 
 
 @lru_cache()
@@ -304,6 +406,13 @@ def _get_headers():
         },
         data={"grant_type": "client_credentials"},
     )
+    if response.status_code in (400, 401):
+        raise requests.HTTPError(
+            f"{response.status_code} from OAuth2 token endpoint.\n"
+            f"  TESTRAY_CLIENT_ID / TESTRAY_CLIENT_SECRET appear to be invalid or revoked.\n"
+            f"  Server response: {response.text.strip()}",
+            response=response,
+        )
     response.raise_for_status()
     return {
         "Authorization": f"Bearer {response.json()['access_token']}",

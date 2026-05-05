@@ -1,6 +1,21 @@
 from jira import JIRA
 import os
+import re
 from functools import lru_cache
+
+
+JIRA_BASE_URL = "https://liferay.atlassian.net"
+
+_JIRA_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
+
+
+def jira_issue_url(issue_key):
+    return f"{JIRA_BASE_URL}/browse/{issue_key}"
+
+
+def is_valid_jira_key(issue_key):
+    """Return True only for strings shaped like LPD-12345."""
+    return bool(issue_key and _JIRA_KEY_RE.match(issue_key.strip()))
 
 
 def close_issue(issue_key, build_hash):
@@ -12,9 +27,18 @@ def close_issue(issue_key, build_hash):
     3. Close all Open subtasks immediately
     4. Move parent to 'Selected for Development'
     5. Close parent with resolution 'Discarded'
+
+    Returns True if the parent issue was actually closed (or would be in
+    DRY_RUN mode), False otherwise (blocked subtask, missing transition,
+    exception). The boolean lets callers report which tickets were closed
+    by the current run.
     """
 
     try:
+        if os.getenv("DRY_RUN", "false").lower() == "true":
+            print(f"[DRY RUN] Would close Jira issue: {issue_key} → {jira_issue_url(issue_key)}")
+            return True
+
         jira = _jira()
 
         # -----------------------------------------
@@ -45,7 +69,7 @@ def close_issue(issue_key, build_hash):
 
         if blocked:
             print(f"⛔ {issue_key} will NOT be touched due to active subtasks.")
-            return
+            return False
 
         print(f"✔ Subtasks valid ({len(open_subtasks)} to close). Proceeding.")
 
@@ -102,14 +126,17 @@ def close_issue(issue_key, build_hash):
             )
             jira.add_comment(issue_key, f"Closed. Not reproducible in SHA {build_hash}")
             print(f"✔ {issue_key} → Closed with resolution 'Discarded'")
+            return True
         else:
             print("✘ Could not find 'Closed' transition for parent.")
+            return False
 
     except Exception as e:
         print(f"✘ Failed to process issue {issue_key}: {e}")
+        return False
 
 
-def create_jira_task(epic, summary, description, component, label, due_date=None):
+def create_jira_task(epic, summary, description, component, label, due_date=None, priority=None, routine_label=None):
     """
     Creates a Jira investigation task for unique failures.
     `component` can be:
@@ -117,7 +144,27 @@ def create_jira_task(epic, summary, description, component, label, due_date=None
       - a list of strings
       - a list of dicts
       - None (defaults to no components)
+    `priority` is an optional Jira priority name (e.g. "Minor", "Medium", "Major", "Critical").
+    `routine_label` is the per-routine identifying label. When None, falls back
+    to the legacy `ROUTINE_LABEL` env var.
+    Returns None if the epic is missing (in live mode).
     """
+
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        epic_info = f" under epic {epic.key} ({jira_issue_url(epic.key)})" if epic else " (no epic)"
+        print(f"[DRY RUN] Would create Jira task: {summary} (priority={priority}){epic_info}")
+
+        class MockIssue:
+            key = "DRY-RUN-KEY"
+
+        return MockIssue()
+
+    if epic is None:
+        print(
+            f"✘ Cannot create Jira task '{summary}': no testing epic found. "
+            "Check the epic JQL in testray_helpers.py."
+        )
+        return None
 
     # Normalize components into the correct format
     if isinstance(component, str):
@@ -147,16 +194,54 @@ def create_jira_task(epic, summary, description, component, label, due_date=None
     if due_date:
         issue_dict["duedate"] = due_date
 
-    new_issue = _jira().create_issue(fields=issue_dict)
+    try:
+        new_issue = _jira().create_issue(fields=issue_dict)
+    except Exception as e:
+        # Jira rejects the create when the detected components don't exist in LPD
+        # and the caller can't create new ones. LPD also requires at least one
+        # component, so we must fall back to a valid existing component.
+        if "component" in str(e).lower():
+            attempted = [
+                c.get("name") if isinstance(c, dict) else c
+                for c in issue_dict.get("components", [])
+            ]
+            fallback = os.getenv("FALLBACK_COMPONENT", "").strip()
+            if not fallback:
+                print(
+                    f"✘ Cannot create '{summary}': components {attempted} "
+                    "are not valid LPD components and FALLBACK_COMPONENT is not set. "
+                    "Add FALLBACK_COMPONENT=<valid LPD component name> to your .env."
+                )
+                return None
+            print(
+                f"⚠ Components {attempted} not found in LPD for '{summary}'. "
+                f"Retrying with FALLBACK_COMPONENT='{fallback}'."
+            )
+            issue_dict["components"] = [{"name": fallback}]
+            new_issue = _jira().create_issue(fields=issue_dict)
+        else:
+            raise
 
+    label_to_apply = routine_label or os.getenv("ROUTINE_LABEL", "routine_tasks")
     _jira().issue(new_issue.key).update(
-        update={"labels": [{"add": "hl_routine_tasks"}]}
+        update={"labels": [{"add": label_to_apply}]}
     )
     if label:
         _jira().issue(new_issue.key).update(update={"labels": [{"add": label}]})
-    if label == "acceptance_failure":
-        issue = _jira().issue(new_issue.key)
-        issue.update(fields={"priority": {"name": "High"}})
+    if priority:
+        try:
+            _jira().issue(new_issue.key).update(fields={"priority": {"name": priority}})
+        except Exception as e_dict:
+            # Some Jira setups (team-managed / custom schemas) expect the
+            # priority field as a plain string rather than {"name": "..."}.
+            try:
+                _jira().issue(new_issue.key).update(fields={"priority": priority})
+            except Exception as e_str:
+                print(
+                    f"⚠ Could not set priority '{priority}' on {new_issue.key}. "
+                    f"Tried dict form ({e_dict}) and string form ({e_str}). "
+                    "Ticket was created but priority is left at default."
+                )
 
     return new_issue
 
@@ -205,6 +290,10 @@ def _transition_to_closed(issue_key, build_hash):
     Closes a single sub-task (directly to 'Closed' with 'Discarded').
     """
     try:
+        if os.getenv("DRY_RUN", "false").lower() == "true":
+            print(f"[DRY RUN] Would transition sub-task {issue_key} to 'Closed' → {jira_issue_url(issue_key)}")
+            return
+
         transitions = _jira().transitions(issue_key)
         close_transition = next((t for t in transitions if t["name"] == "Closed"), None)
 

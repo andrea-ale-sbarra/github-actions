@@ -6,20 +6,25 @@ sys.path.append(os.path.dirname(__file__))
 import re
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
+from urllib.parse import quote_plus
 
 from sentence_transformers import SentenceTransformer, util
 from functools import lru_cache
+from types import SimpleNamespace
 from jira_helpers import (
     get_issue_status_by_key,
     get_issue_type_by_key,
     create_jira_task,
     get_all_issues,
     close_issue,
+    is_valid_jira_key,
+    jira_issue_url,
 )
 from testray_api import (
     STATUS_FAILED_BLOCKED_TESTFIX,
     ACCEPTANCE_ROUTINE_ID,
-    HEADLESS_ROUTINE_ID,
+    COMMERCE_ROUTINE_ID,
+    USER_MANAGEMENT_ROUTINE_ID,
     get_build_tasks,
     get_build_sha,
     create_testflow,
@@ -40,47 +45,295 @@ from testray_api import (
     get_case_count_by_type_in_build,
     get_case_info,
     get_case_type_name,
+    get_routine_to_builds,
 )
 
 
-def analyze_testflow(builds):
+ANALYZED_ROUTINES = (
+    {
+        "id": COMMERCE_ROUTINE_ID,
+        "name": "Commerce",
+        "components": (
+            "Product Information Management",
+            "Order Management",
+            "Shopping Experience",
+        ),
+        # No override: the Testray component → Jira component mapping is used.
+        "jira_component_override": None,
+        # Commerce labels keep reading from .env so existing tickets
+        # tagged via the previous setup remain reachable.
+        "routine_label": os.getenv("ROUTINE_LABEL", "commerce_routine_tasks"),
+        "out_rc_label": os.getenv("OUT_RC_LABEL", "commerce_out_rc"),
+    },
+    {
+        "id": USER_MANAGEMENT_ROUTINE_ID,
+        "name": "User Management",
+        "components": ("User Management",),
+        # Force every ticket created during this routine's run to be tagged
+        # with the "User Management" Jira component, regardless of what
+        # Testray reports for the case.
+        "jira_component_override": "User Management",
+        "routine_label": "um_routine_tasks",
+        "out_rc_label": "um_out_rc",
+    },
+)
+
+
+def select_routines():
+    """
+    Return the routines to process this run, filtered by the optional
+    ROUTINE env var (matches routine id or a case-insensitive substring of
+    the name). Unset → all routines.
+    """
+    selected = os.getenv("ROUTINE", "").strip()
+    if not selected:
+        return ANALYZED_ROUTINES
+
+    needle = selected.lower().replace("_", " ")
+    matched = tuple(
+        r for r in ANALYZED_ROUTINES
+        if needle == str(r["id"]) or needle in r["name"].lower().replace("_", " ")
+    )
+    if not matched:
+        available = ", ".join(f"{r['name']} ({r['id']})" for r in ANALYZED_ROUTINES)
+        raise SystemExit(
+            f"ROUTINE='{selected}' did not match any routine. Available: {available}"
+        )
+    return matched
+
+
+# Routine in scope for the case-history lookups during the current
+# analyze_testflow run. Set by analyze_testflow before doing any work
+# so the deep history helpers (_get_case_result_history_for_routine,
+# _get_case_result_history_for_routine_not_passed) hit the right routine
+# without having to thread routine_id through every intermediate function.
+_CURRENT_ROUTINE_ID = COMMERCE_ROUTINE_ID
+
+
+def analyze_testflow(builds, routine_id):
     """
     Slim orchestration:
       1) find latest DONE build + ensure task exists
       2) fetch testing epic + maybe autofill from previous completed task
       3) process subtasks & results (collect updates only)
       4) apply updates and attempt task completion/cleanup
+
+    Returns (task_id, closure_summary) where:
+      - task_id is None if no analysis happened
+      - closure_summary is None if no stale closure was attempted, otherwise
+        a dict {build_id, build_hash, attempted, closed} from
+        _close_stale_routine_tasks. The caller uses it to print the per-run
+        closure report.
     """
-    latest_build = _get_latest_done_build(builds)
-    if not latest_build:
+    global _CURRENT_ROUTINE_ID
+    previous_routine_id = _CURRENT_ROUTINE_ID
+    _CURRENT_ROUTINE_ID = routine_id
+    try:
+        latest_build = _pick_build_to_analyze(builds)
+        if not latest_build:
+            return None, None
+
+        task_id, latest_build_id = _prepare_task(latest_build)
+
+        if not task_id and os.getenv("DRY_RUN", "false").lower() == "true":
+            task_id, latest_build_id = _find_analyzable_build_for_dry_run(builds)
+
+        if not task_id:
+            print("✘ Could not find or create a valid task, exiting.")
+            return None, None
+
+        sha = get_build_sha(latest_build_id)
+        acceptance_build_id = get_acceptance_build_id_for_current_sha(sha)
+
+        epic = _find_testing_epic()
+        _maybe_autofill_from_previous(builds, latest_build)
+
+        _process_task_subtasks(
+            task_id=task_id,
+            latest_build_id=latest_build_id,
+            epic=epic,
+            acceptance_build_id=acceptance_build_id,
+        )
+
+        closure_summary = _finalize_task_completion(
+            task_id=task_id,
+            latest_build_id=latest_build_id,
+        )
+
+        return task_id, closure_summary
+    finally:
+        _CURRENT_ROUTINE_ID = previous_routine_id
+
+
+def print_slack_summary(routine_runs):
+    """
+    Print one Slack-ready recap covering every routine analyzed in this run.
+
+    `routine_runs` is an iterable of (routine_config, task_id, closure_summary)
+    tuples, where routine_config is an entry from ANALYZED_ROUTINES. The
+    closure_summary slot is unused here (consumed by print_closure_report)
+    but accepted so the same iterable can drive both reports. Routines whose
+    task_id is None (no DONE build, dry-run, etc.) are skipped.
+    """
+    blocks = []
+    for entry in routine_runs:
+        routine, task_id = entry[0], entry[1]
+        if not task_id:
+            continue
+        blocks.extend(_format_routine_block(routine, task_id))
+
+    if not blocks:
         return
 
-    task_id, latest_build_id = _prepare_task(latest_build)
+    message = "\n".join(
+        [
+            "Hi all,",
+            "",
+            "The routine test analysis run just finished and the "
+            "investigation tickets are ready for review.",
+            "",
+            *blocks,
+            "A quick suggestion: have a look to check that recent PRs "
+            "aren't the cause of the failures, then kick off a Claude "
+            ":claude: task to either fix a failing test, convert a Poshi "
+            "test, or fix a real bug. The more we chip away at these, "
+            "the cleaner our acceptance and commerce routines will be — "
+            "which makes it much easier to spot real bugs and ship new "
+            "releases :rocket:",
+            "",
+            "Thanks!",
+        ]
+    )
 
-    if not task_id:
-        print("✘ Could not find or create a valid task, exiting.")
+    separator = "─" * 70
+    print()
+    print(separator)
+    print("Slack-ready summary (copy-paste the block below):")
+    print(separator)
+    print(message)
+    print(separator)
+
+
+def _format_routine_block(routine, task_id):
+    """Build the lines that describe one routine inside the Slack summary."""
+    routine_label = routine["routine_label"]
+    testray_url = f"https://testray.liferay.com/web/testray#/testflow/{task_id}"
+    lines = [
+        f"*{routine['name']}*",
+        f"Testray analysis task: {testray_url}",
+    ]
+
+    components = routine.get("components") or ()
+    if components:
+        lines.append("Open Jira tickets by component:")
+        for component in components:
+            jql = (
+                f'labels = "{routine_label}" '
+                f'AND status != "Closed" '
+                f'AND component = "{component}" '
+                f"ORDER BY created DESC"
+            )
+            url = f"https://liferay.atlassian.net/issues/?jql={quote_plus(jql)}"
+            lines.append(f"- {component}: {url}")
+    else:
+        jql = (
+            f'labels = "{routine_label}" '
+            f'AND status != "Closed" '
+            f"ORDER BY created DESC"
+        )
+        url = f"https://liferay.atlassian.net/issues/?jql={quote_plus(jql)}"
+        lines.append(f"Open Jira tickets: {url}")
+
+    lines.append("")
+    return lines
+
+
+def print_closure_report(routine_runs, recent_build_window=20):
+    """
+    Per-routine recap of tickets closed by stale-closure during this run.
+
+    `routine_runs` is an iterable of (routine_config, task_id, closure_summary)
+    tuples. closure_summary may be None (no closure attempt) or a dict
+    {build_id, build_hash, attempted, closed} from _close_stale_routine_tasks.
+
+    For each routine that closed tickets, the report cross-checks the build
+    SHA that was cited in the closure comment against the most recent N
+    builds of every other routine in ANALYZED_ROUTINES. If the same SHA is
+    also present in another routine's recent builds, flags it as ambiguous
+    — same diagnostic check as diagnose_closed_commerce_tickets.py, but
+    scoped to what this run just closed.
+    """
+    actionable = [
+        (r, s) for (r, _tid, s) in routine_runs
+        if s and s.get("closed")
+    ]
+    if not actionable:
         return
 
-    sha = get_build_sha(latest_build_id)
-    acceptance_build_id = get_acceptance_build_id_for_current_sha(sha)
+    sha_index_by_routine = {}
+    for routine in ANALYZED_ROUTINES:
+        try:
+            builds = get_routine_to_builds(routine["id"])[:recent_build_window]
+        except Exception as e:
+            print(f"⚠ Could not fetch builds for {routine['name']} cross-check: {e}")
+            builds = []
+        sha_index_by_routine[routine["id"]] = {
+            b.get("gitHash"): (b["id"], b.get("name"))
+            for b in builds
+            if b.get("gitHash")
+        }
 
-    epic = _find_testing_epic()
-    _maybe_autofill_from_previous(builds, latest_build)
+    separator = "─" * 70
+    print()
+    print(separator)
+    print("Closure report — tickets closed by this run as 'not reproducible':")
+    print(separator)
 
-    batch_updates, subtasks_to_complete, subtask_to_issues = _process_task_subtasks(
-        task_id=task_id,
-        latest_build_id=latest_build_id,
-        epic=epic,
-        acceptance_build_id=acceptance_build_id,
-    )
+    for routine, summary in actionable:
+        sha = summary.get("build_hash")
+        sha_short = (sha or "")[:12] or "<unknown>"
+        build_id = summary.get("build_id")
+        closed = summary.get("closed", [])
+        attempted = summary.get("attempted", [])
+        skipped = [k for k in attempted if k not in closed]
 
-    _finalize_task_completion(
-        task_id=task_id,
-        latest_build_id=latest_build_id,
-        subtasks_to_complete=subtasks_to_complete,
-        subtask_to_issues=subtask_to_issues,
-        batch_updates=batch_updates,
-    )
+        print(f"\n*{routine['name']}*  build {build_id} (SHA {sha_short})")
+
+        # Cross-check: SHA presence in OTHER routines' recent builds.
+        others_with_sha = []
+        for other in ANALYZED_ROUTINES:
+            if other["id"] == routine["id"]:
+                continue
+            other_index = sha_index_by_routine.get(other["id"], {})
+            if sha and sha in other_index:
+                bid, bname = other_index[sha]
+                others_with_sha.append((other["name"], bid, bname))
+
+        if not sha:
+            print("  ⚠ No build SHA recorded for this closure batch.")
+        elif others_with_sha:
+            for name, bid, bname in others_with_sha:
+                print(
+                    f"  ⚠ SHA also present in {name} build {bid} "
+                    f"({bname}) — closures are SHA-ambiguous; "
+                    "verify by closure timestamp if needed."
+                )
+        else:
+            print(
+                f"  ✓ SHA only present in {routine['name']}'s recent "
+                f"{recent_build_window} builds — closures are unambiguous."
+            )
+
+        print(f"  Closed ({len(closed)}):")
+        for key in closed:
+            print(f"    - {key}  {jira_issue_url(key)}")
+
+        if skipped:
+            print(f"  Attempted but NOT closed ({len(skipped)}) — see logs above:")
+            for key in skipped:
+                print(f"    - {key}  {jira_issue_url(key)}")
+
+    print(separator)
 
 
 def report_aft_ratio_for_latest(builds):
@@ -143,6 +396,33 @@ def _get_latest_done_build(builds):
     return latest_build
 
 
+def _pick_build_to_analyze(builds):
+    """
+    In RESUME mode: scan builds newest-to-oldest and pick the first one whose
+    task is still in analysis (i.e. not COMPLETE and not ABANDONED). This lets
+    you finish an older routine before a fresher build steals the focus.
+    Without RESUME: fall back to the latest DONE build (default behaviour).
+    """
+    if os.getenv("RESUME", "false").lower() != "true":
+        return _get_latest_done_build(builds)
+
+    for b in builds:
+        for t in get_build_tasks(b["id"]):
+            status = t.get("dueStatus", {}).get("key")
+            if status and status not in ("COMPLETE", "ABANDONED"):
+                print(
+                    f"ℹ [RESUME] Resuming build '{b.get('name')}' (id={b['id']}) "
+                    f"task {t['id']} (status={status})"
+                )
+                return b
+
+    print(
+        "ℹ [RESUME] No build with an in-analysis task found. "
+        "Nothing to resume — drop --resume to analyze the latest DONE build normally."
+    )
+    return None
+
+
 def get_acceptance_build_id_for_current_sha(current_sha):
     """
     Find the acceptance build ID matching the given git SHA.
@@ -178,6 +458,12 @@ def _prepare_task(latest_build):
     build_to_tasks = get_build_tasks(latest_build_id)
 
     if not build_to_tasks:
+        if os.getenv("DRY_RUN", "false").lower() == "true":
+            print(
+                f"[DRY RUN] No task exists for build '{latest_build['name']}'. "
+                "Skipping task/testflow creation and subsequent processing."
+            )
+            return None, latest_build_id
         print(
             f"[CREATE] No tasks for build '{latest_build['name']}', creating task and testflow."
         )
@@ -208,12 +494,39 @@ def _prepare_task(latest_build):
     return None, latest_build_id
 
 
-def _headless_epic_jql():
-    _, quarter_number, year = _get_current_quarter_info()
-    return (
-        f"text ~ '{year} Milestone {quarter_number} \\\\| Testing activities \\\\[Headless\\\\]' "
-        f"and type = Epic and project='PUBLIC - Liferay Product Delivery' and status != Closed"
+def _find_analyzable_build_for_dry_run(builds):
+    """
+    In dry-run, if the latest build has no task (so we can't create one), scan older
+    builds for an existing active task and use that for the preview.
+    Returns (task_id or None, build_id or None).
+    """
+    for b in builds:
+        tasks = get_build_tasks(b["id"])
+        for task in tasks:
+            due_status = task.get("dueStatus", {}).get("key")
+            if due_status in ("ABANDONED", "COMPLETE"):
+                continue
+            print(
+                f"ℹ [DRY RUN] Falling back to build '{b.get('name')}' "
+                f"(id={b['id']}) with task {task['id']} for preview."
+            )
+            return task["id"], b["id"]
+
+    print(
+        "ℹ [DRY RUN] No build with an active (non-complete, non-abandoned) task "
+        "was found in recent history. Nothing to preview."
     )
+    return None, None
+
+
+def _testing_epic_jql():
+    epic_key = os.getenv("EPIC_KEY", "").strip()
+    if not epic_key:
+        raise RuntimeError(
+            "EPIC_KEY is not set. Add EPIC_KEY=LPD-XXXXX (the key of the Jira "
+            "epic under which investigation tasks will be filed) to your .env file."
+        )
+    return f"issue = {epic_key}"
 
 
 def _normalize_error(error):
@@ -245,7 +558,8 @@ def _parse_execution_date(date_str):
 
 
 def _find_testing_epic():
-    jql = _headless_epic_jql()
+    jql = _testing_epic_jql()
+
     related_epics = get_all_issues(jql, fields=["summary", "key"])
     print(f"✔ Retrieved {len(related_epics)} related Epics from JIRA")
 
@@ -279,15 +593,11 @@ def _maybe_autofill_from_previous(builds, latest_build):
 
 def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_id):
     """
-    Iterate subtasks, detect unique failures grouped by error, reuse or create Jira tasks,
-    and build batched updates and completion list.
-    Returns (batch_updates, subtasks_to_complete, subtask_to_issues).
+    Iterate subtasks, detect unique failures grouped by error, reuse or create Jira tasks.
+    For each subtask, apply its case-result updates AND mark it COMPLETE immediately,
+    so a crash mid-loop doesn't force a full restart on the next run.
     """
     subtasks = get_task_subtasks(task_id)
-
-    batch_updates = []
-    subtasks_to_complete = []
-    subtask_to_issues = defaultdict(set)
 
     for subtask in subtasks:
         subtask_id = subtask["id"]
@@ -296,9 +606,10 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
             continue
 
         # Always collect any pre-existing result-level issues so they get bubbled up
+        subtask_issues = set()
         existing_issue_keys = _collect_result_issue_keys(results)
         if existing_issue_keys:
-            subtask_to_issues[subtask_id].update(existing_issue_keys)
+            subtask_issues.update(existing_issue_keys)
 
         # 1) Handle already-complete subtasks (backfill issues once if needed)
         if _is_subtask_complete(subtask):
@@ -313,6 +624,7 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
         # Group failures by normalized error so each group can map to its own issue(s)
         groups = _group_failures_by_error(unique_failures)
 
+        subtask_updates = []
         resolved_all_groups = True
         for error_key, group in groups.items():
             updates, issues_str, resolved = _resolve_unique_failures(
@@ -323,58 +635,48 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
                 unique_failures=group,
                 acceptance_build_id=acceptance_build_id,
             )
-            batch_updates.extend(updates)
+            subtask_updates.extend(updates)
             if issues_str:
-                subtask_to_issues[subtask_id].add(issues_str)
+                subtask_issues.add(issues_str)
             resolved_all_groups = resolved_all_groups and resolved
 
-        # 3) Decide if subtask is fully handled
+        # 3) Persist this subtask's result-level links IMMEDIATELY so a later
+        # crash doesn't force ticket re-creation on the next run.
+        if subtask_updates:
+            assign_issue_to_case_result_batch(subtask_updates)
+
+        # 4) Mark subtask COMPLETE immediately if fully handled
         no_unique_failures = len(unique_failures) == 0
         all_handled = first_result_skipped or no_unique_failures or resolved_all_groups
-
-        # 4) Stage subtask for completion if everything is handled
         if all_handled:
-            subtasks_to_complete.append(subtask_id)
+            issues_to_add = _join_issues(subtask_issues)
+            print(
+                f"✔ Marking subtask {subtask_id} as complete and associating issues: {issues_to_add}"
+            )
+            update_subtask_status(subtask_id, issues=issues_to_add)
 
-    return batch_updates, subtasks_to_complete, subtask_to_issues
 
-
-def _finalize_task_completion(
-    *,
-    task_id,
-    latest_build_id,
-    subtasks_to_complete,
-    subtask_to_issues,
-    batch_updates,
-):
+def _finalize_task_completion(*, task_id, latest_build_id):
     """
-    Apply batched updates, complete subtasks, close stale Jira issues, and complete the task.
+    If all subtasks are COMPLETE, close stale routine tickets and complete the task.
+    Individual subtask completion already happened in _process_task_subtasks.
+
+    Returns the closure summary from _close_stale_routine_tasks (or None if
+    the task is not yet complete and no closure was attempted), so the
+    end-of-run report can show what was closed.
     """
-    # Apply batched case result updates first (assign issues to results)
-    if batch_updates:
-        assign_issue_to_case_result_batch(batch_updates)
-
-    # Mark staged subtasks as COMPLETE (aggregating issues if provided)
-    for subtask_id in subtasks_to_complete:
-        issues_to_add = _join_issues(subtask_to_issues.get(subtask_id))
-        print(
-            f"✔ Marking subtask {subtask_id} as complete and associating issues: {issues_to_add}"
-        )
-        update_subtask_status(subtask_id, issues=issues_to_add)
-
-    # Check if all subtasks are done
     subtasks = get_task_subtasks(task_id)
     if not all(s.get("dueStatus", {}).get("key") == "COMPLETE" for s in subtasks):
         print(f"✔ Task {task_id} is not completed. Further processing required.")
-        return
+        return None
 
-    # Close stale open routine tasks in Jira that were not reproduced in this run
     seen_issue_keys = _collect_issue_keys_from_subtasks(subtasks)
-    _close_stale_routine_tasks(latest_build_id, seen_issue_keys)
+    closure_summary = _close_stale_routine_tasks(latest_build_id, seen_issue_keys)
 
     print(f"✔ All subtasks are complete, completing task {task_id}")
     complete_task(task_id)
     print(f"✔ Task {task_id} is now complete. No further processing required.")
+    return closure_summary
 
 
 def _is_subtask_complete(subtask):
@@ -502,6 +804,12 @@ def _resolve_unique_failures(
     )
 
     if not issue:
+        print(
+            f"⚠ Could not create investigation task for subtask {subtask_id} "
+            f"(failures in group: {len(unique_failures)}, "
+            f"first case_id={probe['case_id']}, error preview={probe['error'][:120]!r}). "
+            f"Subtask will stay INANALYSIS."
+        )
         return [], None, False
 
     issue_key = issue.key
@@ -540,39 +848,85 @@ def _collect_issue_keys_from_subtasks(subtasks):
         k.strip()
         for s in subtasks
         for k in str(s.get("issues", "")).split(",")
-        if k.strip()
+        if is_valid_jira_key(k)
     }
 
 
 def _collect_result_issue_keys(results):
     """
     From subtask results, collect any issue keys present in the `issues` field.
-    Handles entries that may already be analyzed.
+    Skip free-text entries that don't look like Jira keys (e.g. "CI error").
     """
     return {
         k.strip()
         for r in results
         if r.get("issues")
         for k in str(r["issues"]).split(",")
-        if k.strip()
+        if is_valid_jira_key(k)
     }
 
 
 def _close_stale_routine_tasks(latest_build_id, seen_issue_keys):
     """
-    Close open 'hl_routine_tasks' that did not appear in this run (not reproducible).
+    Close open routine tickets that did not appear in this run (not reproducible).
+
+    Scoped to the current routine's labels: each routine in ANALYZED_ROUTINES
+    has its own routine_label/out_rc_label so the JQL only matches tickets
+    that actually belong to the routine being analyzed. Running one routine
+    in isolation never touches the other routine's tickets.
+
+    Returns a dict describing what was attempted/closed, so the caller can
+    surface a closure recap at the end of the run:
+        {
+            "build_id": int,
+            "build_hash": str | None,
+            "attempted": [issue_key, ...],
+            "closed":    [issue_key, ...],
+        }
     """
-    jql = "labels in ('hl_routine_tasks') AND labels not in ('test_fix', 'headless_out_rc') AND status not in ('Closed')"
+    summary = {
+        "build_id": latest_build_id,
+        "build_hash": None,
+        "attempted": [],
+        "closed": [],
+    }
+
+    routine = _get_routine_config(_CURRENT_ROUTINE_ID)
+    if not routine:
+        print(
+            f"⚠ No routine config for id {_CURRENT_ROUTINE_ID}; "
+            "skipping stale-ticket closure."
+        )
+        return summary
+
+    routine_label = routine["routine_label"]
+    out_rc_label = routine["out_rc_label"]
+    jql = (
+        f"labels in ('{routine_label}') "
+        f"AND labels not in ('test_fix', '{out_rc_label}') "
+        f"AND status not in ('Closed')"
+    )
     open_jira_issues = get_all_issues(jql, fields=["key"])
     open_keys = {issue.key for issue in open_jira_issues}
-    to_close = open_keys - seen_issue_keys
+    to_close = sorted(open_keys - seen_issue_keys)
     if to_close:
         build_hash = _get_current_build_hash(latest_build_id)
+        summary["build_hash"] = build_hash
+        summary["attempted"] = list(to_close)
         print(
             f"ℹ Found {len(to_close)} issues to close as they are not reproducible in this run."
         )
         for issue_key in to_close:
-            close_issue(issue_key, build_hash)
+            if close_issue(issue_key, build_hash):
+                summary["closed"].append(issue_key)
+    return summary
+
+
+def _get_routine_config(routine_id):
+    for r in ANALYZED_ROUTINES:
+        if r["id"] == routine_id:
+            return r
+    return None
 
 
 def _sort_cases_by_duration(subtask_case_pairs, case_duration_lookup):
@@ -626,6 +980,10 @@ def _build_case_rows(sorted_cases, case_duration_lookup, build_id, history_cache
             )
             component_name = (
                 get_component_name(component_id) if component_id else "Unknown"
+            )
+            print(
+                f"  [component] case_id={case_id} component_id={component_id} "
+                f"→ '{component_name}'"
             )
             raw_duration = case_duration_lookup.get(int(case_id))
             duration = raw_duration if isinstance(raw_duration, (int, float)) else None
@@ -784,6 +1142,9 @@ def _find_similar_open_issues(case_id, result_error, *, return_list=False):
             issue_key = raw_key.strip()
             if not issue_key or issue_key in seen_issues:
                 continue
+            if not is_valid_jira_key(issue_key):
+                seen_issues.add(issue_key)
+                continue
 
             try:
                 _, status = get_issue_status_by_key(issue_key)
@@ -819,6 +1180,62 @@ def _find_similar_open_issues(case_id, result_error, *, return_list=False):
 
     # No similar errors with open issues found
     return [] if return_list else (False, None)
+
+
+_INVESTIGATE_SUMMARY_RE = re.compile(
+    r"^(?:\[[^\]]+\]\s+)?Investigate\s+(.*?)(?:\.{3})?\s*$"
+)
+
+
+def _find_existing_open_ticket_for_error(epic, error_text):
+    """
+    Pre-creation dedup: search Jira for an already-open routine task whose
+    summary describes the same error semantically. Catches the case where the
+    case-result history lookup misses a ticket (e.g. issues field never
+    persisted on the previous result, or autofill didn't run).
+    Returns the existing issue key, or None.
+    """
+    routine = _get_routine_config(_CURRENT_ROUTINE_ID)
+    routine_label = (
+        routine["routine_label"] if routine
+        else os.getenv("ROUTINE_LABEL", "routine_tasks")
+    )
+
+    jql_parts = [
+        f'labels = "{routine_label}"',
+        'status != "Closed"',
+    ]
+    if epic is not None:
+        jql_parts.append(f'parent = "{epic.key}"')
+    jql = " AND ".join(jql_parts)
+
+    try:
+        candidates = get_all_issues(jql, fields=["summary"])
+    except Exception as e:
+        print(f"⚠ JQL pre-creation dedup lookup failed ({e}); proceeding to create.")
+        return None
+
+    if not candidates:
+        return None
+
+    new_marker = (error_text or "")[:80]
+    new_norm = _normalize_error(error_text or "")
+
+    for c in candidates:
+        summary = (getattr(c.fields, "summary", None) or "").strip()
+        if new_marker and new_marker in summary:
+            return c.key
+
+        m = _INVESTIGATE_SUMMARY_RE.match(summary)
+        if not m:
+            continue
+        candidate_error = m.group(1).strip()
+        if not candidate_error:
+            continue
+        if _are_errors_similar(new_norm, _normalize_error(candidate_error)):
+            return c.key
+
+    return None
 
 
 def _report_poshi_tests_decrease(start_of_quarter_count, current_count):
@@ -883,15 +1300,58 @@ def _build_case_duration_lookup(unique_tasks, build_id):
 
 
 def _get_case_result_history_for_routine(case_id):
-    items = fetch_case_results(case_id, HEADLESS_ROUTINE_ID)
+    items = fetch_case_results(case_id, _CURRENT_ROUTINE_ID)
     return _sort_by_execution_date_desc(items)
 
 
 def _get_case_result_history_for_routine_not_passed(case_id):
     items = fetch_case_results(
-        case_id, HEADLESS_ROUTINE_ID, status=STATUS_FAILED_BLOCKED_TESTFIX
+        case_id, _CURRENT_ROUTINE_ID, status=STATUS_FAILED_BLOCKED_TESTFIX
     )
     return _sort_by_execution_date_desc(items)
+
+
+_PRIORITY_LADDER = [
+    (13, "High"),
+    (8, "Medium"),
+    (5, "Normal"),
+    (3, "Low"),
+]
+
+
+def _days_since_last_pass(case_id, history_cache):
+    """
+    Returns days since the most recent PASSED execution for this case.
+    Returns None if history is empty or dates can't be parsed,
+    so the caller can apply a sensible default.
+    Returns 9999 if the case has a history but never passed,
+    so the caller can treat it as chronically failing.
+    """
+    history = history_cache.get(case_id)
+    if history is None:
+        history = _get_case_result_history_for_routine(case_id)
+        history_cache[case_id] = history
+
+    if not history:
+        return None
+
+    for item in history:
+        if item.get("status") == "PASSED":
+            dt = _parse_execution_date(item.get("executionDate", ""))
+            if dt:
+                return (datetime.now() - dt).days
+
+    return 9999
+
+
+def _priority_for_days(days):
+    """Map days-since-last-pass to Jira priority name. No history → Low."""
+    if days is None:
+        return "Low"
+    for threshold, name in _PRIORITY_LADDER:
+        if days >= threshold:
+            return name
+    return "Low"
 
 
 def _sort_by_execution_date_desc(items):
@@ -947,6 +1407,7 @@ def _get_current_build_hash(build_id):
 def _build_investigation_intro(
         task_id, subtask_id, acceptance_present, test_type
 ):
+    out_rc_label = os.getenv("OUT_RC_LABEL", "out_rc")
     lines = []
 
     # ---- INTRO ----
@@ -957,7 +1418,7 @@ def _build_investigation_intro(
             "*Purpose of this issue*",
             "",
             "The purpose of this ticket is to investigate one or more test failures detected in the "
-            "[*Headless routine*|https://testray.liferay.com/#/project/35392/routines/994140]",
+            "Testray test routine.",
             "",
             "This issue aggregates *unique failures* for the related Testray subtask and defines the "
             "investigation workflow to determine:",
@@ -987,7 +1448,7 @@ def _build_investigation_intro(
             "",
             "* If the test(s) *PASS locally*: ",
             "** The failure is likely caused by *flakiness*.",
-            "** Check the *Testray history* for this case in the Headless routine.",
+            "** Check the *Testray history* for this case in the test routine.",
             "** Determine whether this was a one-time fluke or a strong flakiness case that needs to be addressed.",
             "",
             "* If the test(s) *FAIL locally*: continue with Step 2.",
@@ -1029,7 +1490,7 @@ def _build_investigation_intro(
                 "",
                 "* Fix the issue directly in the *Playwright* layer if owned by our team.",
                 "* If the change was introduced by an external team:",
-                "** add the label *headless_out_rc* to this ticket (mandatory) ,",
+                f"** add the label *{out_rc_label}* to this ticket (mandatory) ,",
                 "** reassign the component accordingly,",
                 "** set assignee to *Automatic*.",
                 "* Leave a comment describing:",
@@ -1048,7 +1509,7 @@ def _build_investigation_intro(
                 "* If you are confident the failure is only a test fix (e.g. JSON copy or expected data change), keep it as a *Test Fix*.",
                 "* If the change is intended and you know what introduced it, you may handle the fix yourself.",
                 "* If the failure was introduced by another team:",
-                "** always add the label *headless_out_rc* to this ticket (mandatory),",
+                f"** always add the label *{out_rc_label}* to this ticket (mandatory),",
                 "* If you are blocked, reprioritized, or the root cause is unclear:",
                 "** leave investigation and ownership to the team or developer who introduced the change,",
                 "** reassign the component to the LPD corresponding to the commit that introduced the change, if handing over to another team,",
@@ -1085,7 +1546,7 @@ def _build_investigation_intro(
             "h3. 🐞 Bug Finalization",
             "",
             "*Once a Bug is created:*",
-            "** If bug introduced by an external team: add the label *headless_out_rc* to this ticket (mandatory).",
+            f"** If bug introduced by an external team: add the label *{out_rc_label}* to this ticket (mandatory).",
             "** Link the Bug LPD as *Caused By* to this ticket (mandatory).",
             "** Replace this ticket’s LPD with the Bug LPD in:",
             f"** [Testray Subtask|https://testray.liferay.com/web/testray#/testflow/{task_id}/subtasks/{subtask_id}] → Subtask Details → ISSUES",
@@ -1097,50 +1558,6 @@ def _build_investigation_intro(
             "",
         ]
     )
-
-    if test_type in ("integration", "playwright", "unit"):
-        lines.extend(
-            [
-                "h3. 🧠 Retrospective & Prevention (Mandatory for External Causes)",
-                "",
-                "*Purpose*",
-                "",
-                "When the failure or required fix is caused by an *external team*, a retrospective is required to "
-                "understand *why this issue reached master* and to prevent similar occurrences in the future.",
-                "",
-                "This step is *not part of the investigation workflow itself*, but a *follow-up action* once the "
-                "root cause and ownership are clear.",
-                "",
-                "*Goals of this step:*",
-                "* Identify gaps in CI coverage, test execution, or review processes.",
-                "* Understand whether test failures were:",
-                "** ignored,",
-                "** not executed in the relevant suite,",
-                "** bypassed due to direct master changes, or",
-                "** missed due to process or tooling limitations.",
-                "* Capture learnings that help improve test reliability and release quality going forward.",
-                "",
-                "*Action Required*",
-                "",
-                "* Add an entry to the shared retrospective table:",
-                "** [Google Docs|https://docs.google.com/spreadsheets/d/1SWYSNILlZo2SsgVD-qbjY5OYB20CVNC28006--Q9UKE/edit?usp=sharing]",
-                "",
-                "* Include concise and factual information describing:",
-                "** which tests were affected,",
-                "** the responsible component or area,",
-                "** the root cause (linking the relevant PR or commit),",
-                "** the reason the change reached master despite failures,",
-                "** and any relevant tracking ticket or notes.",
-                "",
-                "*Outcome Expectation*",
-                "",
-                "The intent is *not to assign blame*, but to:",
-                "* surface systemic issues,",
-                "* improve validation and enforcement mechanisms, and",
-                "* reduce recurrence of similar test failures in future releases.",
-                "",
-            ]
-        )
 
     return lines
 
@@ -1257,25 +1674,36 @@ def _create_investigation_task_for_subtask(
 
     description = "\n".join(description_lines + flow_intro)
 
-    jira_components = [
-        {
-            "API Builder": "API Builder",
-            "Connectors": "Data Integration > Connectors",
-            "Data Migration Center": "Data Integration > Data Migration Center",
-            "Export/Import": "Data Integration > Export/Import",
-            "Headless Batch Engine API": "Headless Batch Engine API",
-            "Headless Discovery Application": "Headless Discovery Application",
-            "Job Scheduler": "Data Integration > Job Scheduler",
-            "Object": "Objects > Object Entries REST APIs",
-            "Object Entries REST APIs": "Objects > Object Entries REST APIs",
-            "REST Builder": "REST Builder",
-            "REST Infrastructure": "REST Infrastructure",
-            "Site Templates": "Content Publishing > Site Templates",
-            "Staging": "Data Integration > Staging",
-            "Upgrades Staging": "Data Integration > Staging",
-        }.get(c, c)
-        for c in (component_name or "Unknown").split(",")
-    ]
+    current_routine = _get_routine_config(_CURRENT_ROUTINE_ID)
+    component_override = (
+        current_routine.get("jira_component_override") if current_routine else None
+    )
+    if component_override:
+        jira_components = [component_override]
+    else:
+        jira_components = [
+            {
+                "API Builder": "API Builder",
+                "Commerce": "Product Information Management",
+                "Connectors": "Data Integration > Connectors",
+                "Data Migration Center": "Data Integration > Data Migration Center",
+                "Export/Import": "Data Integration > Export/Import",
+                "Headless Batch Engine API": "Headless Batch Engine API",
+                "Headless Discovery Application": "Headless Discovery Application",
+                "Job Scheduler": "Data Integration > Job Scheduler",
+                "Object": "Objects > Object Entries REST APIs",
+                "Object Entries REST APIs": "Objects > Object Entries REST APIs",
+                "Order Management": "Order Management",
+                "Product Info Management": "Product Information Management",
+                "REST Builder": "REST Builder",
+                "REST Infrastructure": "REST Infrastructure",
+                "Shopping Experience": "Shopping Experience",
+                "Site Templates": "Content Publishing > Site Templates",
+                "Staging": "Data Integration > Staging",
+                "Upgrades Staging": "Data Integration > Staging",
+            }.get(c, c)
+            for c in (component_name or "Unknown").split(",")
+        ]
 
     label = "acceptance_failure" if acceptance_present else None
 
@@ -1288,6 +1716,23 @@ def _create_investigation_task_for_subtask(
 
     due_date_str = due_date.strftime("%Y-%m-%d")
 
+    max_days_failing = max(
+        (
+            _days_since_last_pass(f["case_id"], case_history_cache) or 0
+            for f in subtask_unique_failures
+        ),
+        default=0,
+    )
+    priority = _priority_for_days(max_days_failing)
+
+    existing_key = _find_existing_open_ticket_for_error(epic, first_error)
+    if existing_key:
+        print(
+            f"♻ Reusing existing open ticket {existing_key} for subtask {subtask_id} "
+            f"(matched on Jira summary similarity → skipping creation)"
+        )
+        return SimpleNamespace(key=existing_key)
+
     issue = create_jira_task(
         epic=epic,
         summary=summary,
@@ -1295,7 +1740,12 @@ def _create_investigation_task_for_subtask(
         component=jira_components,
         label=label,
         due_date=due_date_str,
+        priority=priority,
+        routine_label=current_routine["routine_label"] if current_routine else None,
     )
+
+    if not issue:
+        return None
 
     print(f"✔ Created investigation task for subtask {subtask_id}: {issue.key}")
     return issue
