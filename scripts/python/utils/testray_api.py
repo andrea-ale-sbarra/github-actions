@@ -61,7 +61,7 @@ def autofill_build(testray_build_id_1, testray_build_id_2):
         )
         return {}
     url = f"{TESTRAY_REST_URL}/testray-build-autofill/{testray_build_id_1}/{testray_build_id_2}"
-    response = requests.post(url, headers=_get_headers(), data="")
+    response = _request_with_auth_retry("POST", url, data="")
     _raise_for_status(response, f"autofilling build {testray_build_id_2} from {testray_build_id_1}")
     return response.json()
 
@@ -72,10 +72,8 @@ def complete_task(task_id):
         return {}
     url = f"{BASE_URL}/tasks/{task_id}"
     payload = {"dueStatus": {"key": "COMPLETE", "name": "Complete"}}
-    response = requests.patch(
-        url,
-        json=payload,
-        headers={**_get_headers(), "Content-Type": "application/json"},
+    response = _request_with_auth_retry(
+        "PATCH", url, json=payload, headers={"Content-Type": "application/json"}
     )
     _raise_for_status(response, f"completing task {task_id}")
     return response.json()
@@ -94,10 +92,11 @@ def create_task(build):
         "r_buildToTasks_c_buildId": build["id"],
         "dueStatus": {"key": "INANALYSIS", "name": "In Analysis"},
     }
-    response = requests.post(
+    response = _request_with_auth_retry(
+        "POST",
         f"{BASE_URL}/tasks/",
         json=payload,
-        headers={**_get_headers(), "Content-Type": "application/json"},
+        headers={"Content-Type": "application/json"},
     )
     _raise_for_status(response, f"creating task for build {build['id']}")
     return response.json()
@@ -112,7 +111,7 @@ def create_testflow(task_id):
         )
         return {}
     url = f"{TESTRAY_REST_URL}/testray-testflow/{task_id}"
-    response = requests.post(url, headers=_get_headers(), data="")
+    response = _request_with_auth_retry("POST", url, data="")
     _raise_for_status(response, f"creating testflow for task {task_id}")
     return response.json()
 
@@ -355,12 +354,28 @@ def _get_json(url, max_retries=3):
     raise RuntimeError(f"Failed to fetch JSON from {url} after {max_retries} attempts.")
 
 
+def _request_with_auth_retry(method, url, **kwargs):
+    """Issue an HTTP request, refreshing the cached OAuth token on 401 and retrying once.
+
+    The token from _get_headers() is lru_cached but has a finite server-side TTL,
+    so long-running scripts eventually see a 401 mid-run on the first write.
+    """
+    extra_headers = kwargs.pop("headers", {}) or {}
+    response = requests.request(
+        method, url, headers={**_get_headers(), **extra_headers}, **kwargs
+    )
+    if response.status_code == 401:
+        _get_headers.cache_clear()
+        response = requests.request(
+            method, url, headers={**_get_headers(), **extra_headers}, **kwargs
+        )
+    return response
+
+
 def _put_json(url, payload):
     """Send PUT request with JSON payload."""
-    response = requests.put(
-        url,
-        json=payload,
-        headers={**_get_headers(), "Content-Type": "application/json"},
+    response = _request_with_auth_retry(
+        "PUT", url, json=payload, headers={"Content-Type": "application/json"}
     )
     _raise_for_status(response, f"PUT {url}")
     return response.json()

@@ -231,7 +231,7 @@ def _format_routine_block(routine, task_id):
                 f'labels = "{routine_label}" '
                 f'AND status != "Closed" '
                 f'AND component = "{component}" '
-                f"ORDER BY created DESC"
+                f"ORDER BY priority DESC"
             )
             url = f"https://liferay.atlassian.net/issues/?jql={quote_plus(jql)}"
             lines.append(f"- {component}: {url}")
@@ -239,7 +239,7 @@ def _format_routine_block(routine, task_id):
         jql = (
             f'labels = "{routine_label}" '
             f'AND status != "Closed" '
-            f"ORDER BY created DESC"
+            f"ORDER BY priority DESC"
         )
         url = f"https://liferay.atlassian.net/issues/?jql={quote_plus(jql)}"
         lines.append(f"Open Jira tickets: {url}")
