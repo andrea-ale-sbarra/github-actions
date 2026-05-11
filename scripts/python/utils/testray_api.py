@@ -13,6 +13,12 @@ TESTRAY_UI_URL = "https://testray.liferay.com/web/testray"
 COMMERCE_ROUTINE_ID = 35394
 USER_MANAGEMENT_ROUTINE_ID = 1874638
 ACCEPTANCE_ROUTINE_ID = 590307
+# All three routines above live under the same Testray project (the one
+# whose URL path is `#/project/35392/...`). Hardcoded because the routine
+# entity doesn't expose its parent project id under any of the obvious
+# field names; if a new routine moves to a different project, override
+# this here.
+LIFERAY_PORTAL_PROJECT_ID = 35392
 STATUS_FAILED_BLOCKED_TESTFIX = "FAILED,TESTFIX,BLOCKED"
 
 
@@ -30,8 +36,52 @@ def testray_subtask_url(subtask_id, task_id=None):
     return f"{TESTRAY_UI_URL}#/subtasks/{subtask_id}"
 
 
-def testray_case_result_url(case_result_id):
+def testray_case_result_url(case_result_id, project_id=None, routine_id=None, build_id=None):
+    """Build a Testray UI URL for a case result.
+
+    When `project_id`, `routine_id` and `build_id` are all provided, use
+    the full path form
+        #/project/<p>/routines/<r>/build/<b>/case-result/<cr>
+    which the current Testray UI actually resolves. The legacy short form
+    `#/caseresults/<id>` 404s on the modern UI, so the full form is
+    required for any link the user is meant to click. The short form is
+    kept as a fallback for callers (e.g. DRY-RUN logs) that don't have
+    the surrounding build context handy.
+    """
+    if project_id and routine_id and build_id:
+        return (
+            f"{TESTRAY_UI_URL}#/project/{project_id}"
+            f"/routines/{routine_id}/build/{build_id}"
+            f"/case-result/{case_result_id}"
+        )
     return f"{TESTRAY_UI_URL}#/caseresults/{case_result_id}"
+
+
+def testray_build_filtered_by_case_name_url(project_id, routine_id, build_id, case_name):
+    """Build a Testray UI URL that lands on `build_id` with its result
+    list filtered to the rows matching `case_name`.
+
+    This is the link form the user actually clicks: it shows the test in
+    the context of the build (latest run, history, retries, errors), and
+    it sidesteps the `case-result/<id>` path, which 404s on the legacy
+    short form and is fragile against UI URL changes.
+
+    The filter is the same JSON Testray's UI writes to the query string
+    when you type into the search box:
+        {"testrayCaseName": "<full.case.name>"}
+    """
+    import json
+    from urllib.parse import quote
+
+    filter_payload = json.dumps(
+        {"testrayCaseName": case_name}, separators=(",", ":")
+    )
+    encoded = quote(filter_payload, safe="")
+    return (
+        f"{TESTRAY_UI_URL}#/project/{project_id}"
+        f"/routines/{routine_id}/build/{build_id}"
+        f"?filter={encoded}&filterSchema=buildResults&page=1"
+    )
 
 
 def assign_issue_to_case_result_batch(batch_updates):
@@ -139,13 +189,31 @@ def fetch_case_results(case_id, routine_id, status=None, page_size=500):
     return all_items
 
 
-def get_all_build_case_results(build_id):
-    """Fetch all case results for a given build (paginated)."""
+def get_all_build_case_results(build_id, include_case=False, verbose=False):
+    """Fetch all case results for a given build (paginated).
+
+    Set `include_case=True` to inline the nested `r_caseToCaseResult_c_case`
+    object on each item — saves one `get_case_info` round-trip per case when
+    the caller needs the case `name`.
+
+    Set `verbose=True` to print per-page progress; useful for slow builds
+    (Acceptance routinely returns thousands of case results).
+    """
     page = 1
     all_items = []
+    nested = "&nestedFields=r_caseToCaseResult_c_case" if include_case else ""
 
     while True:
-        url = f"{BASE_URL}/builds/{build_id}/buildToCaseResult?pageSize=500&page={page}"
+        if verbose:
+            print(
+                f"    · fetching case results page {page} "
+                f"({len(all_items)} so far)...",
+                flush=True,
+            )
+        url = (
+            f"{BASE_URL}/builds/{build_id}/buildToCaseResult"
+            f"?pageSize=500&page={page}{nested}"
+        )
         data = _get_json(url)
         items = data.get("items", [])
         all_items.extend(items)
@@ -153,6 +221,9 @@ def get_all_build_case_results(build_id):
         if len(items) < 500:
             break
         page += 1
+
+    if verbose:
+        print(f"    · fetched {len(all_items)} case result(s) total", flush=True)
 
     return all_items
 
@@ -162,6 +233,105 @@ def get_build_info(build_id):
     """Get build metadata, including routine ID and due date."""
     url = f"{BASE_URL}/builds/{build_id}?fields=dueDate,gitHash,name,id,importStatus,r_routineToBuilds_c_routineId&nestedFields=buildToTasks"
     return _get_json(url)
+
+
+@lru_cache(maxsize=None)
+def get_routine_info(routine_id):
+    """Get routine metadata (project association, name, etc.).
+
+    Cached: a routine's owning project doesn't change during a run, and
+    the URL builders need it once per routine.
+    """
+    url = f"{BASE_URL}/routines/{routine_id}"
+    return _get_json(url)
+
+
+def find_cases_by_name_substring(name_substring, limit=20):
+    """Return Testray cases whose `name` contains `name_substring`.
+
+    Used by the PR review check to map a Java test class name (taken
+    from a merge diff) to the Testray case(s) that exercise it, without
+    paginating through every case result of a build. `limit` caps the
+    response in the rare event that several packages contain a class
+    with the same simple name.
+    """
+    from urllib.parse import quote_plus
+
+    encoded = quote_plus(f"contains(name,'{name_substring}')")
+    url = (
+        f"{BASE_URL}/cases?filter={encoded}"
+        f"&fields=id,name&pageSize={limit}"
+    )
+    return _get_json(url).get("items", []) or []
+
+
+def find_case_by_exact_name(name):
+    """Look up the case whose `name` equals `name` exactly. Returns one
+    case dict ({id, name}) or None.
+
+    Faster and more accurate than the substring matcher when the caller
+    already has the Java FQN of the test (derived from the file path).
+    """
+    from urllib.parse import quote
+
+    encoded = quote(f"name eq '{name}'")
+    url = f"{BASE_URL}/cases?filter={encoded}&fields=id,name&pageSize=2"
+    items = _get_json(url).get("items", []) or []
+    for item in items:
+        if item.get("name") == name:
+            return item
+    return None
+
+
+def find_case_result_in_build_via_history(build_id, case_id):
+    """Find the case result for `case_id` within `build_id`.
+
+    Walks the testray-rest `case-result-history` endpoint for the case,
+    filtered server-side to the Acceptance routine and (when honored)
+    to the specific build. The endpoint is already used elsewhere in
+    this script for AFT history and is the reliable way to navigate
+    from (case, build) to a specific case-result row.
+
+    Returns a dict shaped as:
+        {"id": <case_result_id>, "dueStatus": {"name": "<STATUS>"}}
+    or None when the case did not run in this build.
+    """
+    expected_build = int(build_id)
+    base_url = f"{TESTRAY_REST_URL}/testray-case-result-history/{case_id}"
+
+    page = 1
+    page_size = 500
+    while True:
+        params = (
+            f"testrayRoutineIds={ACCEPTANCE_ROUTINE_ID}"
+            f"&testrayBuildIds={expected_build}"
+            f"&page={page}&pageSize={page_size}"
+        )
+        url = f"{base_url}?{params}"
+        result = _get_json(url) or {}
+        items = result.get("items", []) or []
+
+        for entry in items:
+            # Defensive: even if `testrayBuildIds` isn't honored
+            # server-side, only accept the entry that's actually for
+            # the build we asked about.
+            if int(entry.get("testrayBuildId") or 0) != expected_build:
+                continue
+            cr_id = (
+                entry.get("testrayCaseResultId")
+                or entry.get("caseResultId")
+                or entry.get("id")
+            )
+            return {
+                "id": cr_id,
+                "dueStatus": {"name": entry.get("status")},
+            }
+
+        if len(items) < page_size:
+            break
+        page += 1
+
+    return None
 
 
 def get_build_tasks(build_id):

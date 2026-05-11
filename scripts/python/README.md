@@ -14,6 +14,7 @@ Set of Python scripts that analyze Testray routine results (Commerce, User Manag
    - `EPIC_KEY` — Jira epic under which to create analysis tasks (e.g. `LPD-73638`)
    - `ROUTINE_LABEL`, `OUT_RC_LABEL` — Jira labels used to filter routine tickets
    - `FALLBACK_COMPONENT` — fallback Jira component when the Testray one doesn't exist on LPD
+   - `GITHUB_TOKEN` *(optional)* — GitHub PAT for the PR review check. Without it the GitHub API is rate-limited to 60 req/h
 
 `.env` is gitignored and is never committed. Dependencies are managed by `uv` (see `pyproject.toml` / `uv.lock`); `run_local.sh` invokes `uv run` to execute each script.
 
@@ -39,6 +40,7 @@ These replace the main analyzer, they don't run alongside it.
 | `--diagnose` | `diagnose_closed_commerce_tickets.py` | For every ticket labeled `commerce_routine_tasks` closed today, extracts the SHA cited in the closing comment and cross-references it against the most recent 20 Commerce and UM builds. Used to distinguish legitimate closures (SHA exclusive to Commerce) from incorrect ones (SHA exclusive to UM) |
 | `--inspect` | `inspect_builds.py` | Lists the most recent 20 builds of every selected routine, with `id`, `importStatus`, `dateCreated`, `dueDate`, `gitHash`. Exposes the fields the Testray UI doesn't show but that the picker uses |
 | `--build <id> [<id> ...]` | `inspect_builds.py <ids>` | Inspects specific builds by id. Useful when a build appears in the Testray UI but isn't returned by the routine's API |
+| `--check-pr-failures` | `check_pr_failures.py` | For every Jira ticket tagged with the routine's `check_label` (`commerce_check_failures` / `um_check_failures`), scans the ticket's comments for the final reviewer's "View total diff: `<base>...<head>`" link, calls GitHub's compare endpoint for the file list, finds the Acceptance build whose `gitHash` matches `<head>`, and prints a Slack-ready block with each touched test file's status (PASSED / FAILED / BLOCKED / NOT FOUND). Read-only |
 | `--priorities` | `discover_jira_priorities.py` | Lists the Jira priorities defined in the instance and the ones allowed on LPD/Task. Use it when updating `_PRIORITY_LADDER` in `utils/testray_helpers.py` |
 
 ### Examples
@@ -64,6 +66,11 @@ These replace the main analyzer, they don't run alongside it.
 
 # Inspect two specific builds by id
 ./run_local.sh --build 470911677 --build 470910001
+
+# PR review check: re-check the merged Jira tickets against the latest
+# Acceptance build, without re-running the full testflow analysis
+./run_local.sh --check-pr-failures
+./run_local.sh --check-pr-failures --routine user_management
 ```
 
 ## File layout
@@ -74,6 +81,7 @@ These replace the main analyzer, they don't run alongside it.
 - **`print_slack_summary.py`** — re-prints the Slack message for the latest DONE build of every routine without re-running the analysis. Useful to recover the recap after a run has already finished.
 - **`diagnose_closed_commerce_tickets.py`** — diagnostic for automatic closures. For every Commerce ticket closed today, extracts the SHA cited in the closing comment (format `Closed. Not reproducible in SHA <hash>`) and compares it against the latest Commerce and UM builds, flagging closures that are likely incorrect.
 - **`inspect_builds.py`** — picker diagnostic. Prints the most recent builds of every routine as the Testray API returns them (`id`, `importStatus`, `dateCreated`, `dueDate`, `gitHash`, etc.) or, if you pass it some ids (integers > 1000), inspects those specific ones.
+- **`check_pr_failures.py`** — standalone PR review check. Iterates every Jira ticket tagged with each routine's `check_label`, parses the final reviewer's "View total diff" link out of the comments, looks up the Acceptance build by the merge HEAD SHA, and reports each test file's status (PASSED/FAILED/BLOCKED/NOT FOUND). The same routine is also invoked at the end of every main run, with the block appended to the Slack recap. **Operator step**: paste the reviewer's "Merged. Thank you. View total diff: `<base>...<head>`" comment into the Jira ticket (alongside the `*_check_failures` label) before running.
 - **`discover_jira_priorities.py`** — lists the Jira priorities available in the instance and the ones allowed by `createmeta` for LPD/Task. Re-run it when the Jira schema changes, to align `_PRIORITY_LADDER` in `utils/testray_helpers.py`.
 
 ### Support modules (`utils/`)
@@ -81,6 +89,8 @@ These replace the main analyzer, they don't run alongside it.
 - **`testray_api.py`** — wrapper around the Testray API (OAuth2 authentication, fetching of routines, builds, tasks, case results).
 - **`testray_helpers.py`** — high-level logic: routine selection (`select_routines`), testflow analysis (`analyze_testflow`), AFT report, Slack recap, closures report, priority ladder (`_PRIORITY_LADDER`).
 - **`jira_helpers.py`** — Jira wrapper (issue create/update/close, comment and label management).
+- **`github_api.py`** — minimal read-only wrapper around the GitHub REST API. The PR review check only needs the `compare/{base}...{head}` endpoint.
+- **`pr_check.py`** — PR review check logic: parses the final reviewer's "View total diff" link out of the Jira comments on a `check_label`-tagged ticket, fetches the changed files via GitHub compare, matches touched test files against case results in the matching Acceptance build, and produces the Slack-ready block consumed by both the main run and the standalone script.
 
 ## Run modes
 

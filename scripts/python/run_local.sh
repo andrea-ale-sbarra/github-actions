@@ -44,14 +44,14 @@ while (( $# > 0 )); do
     case "$1" in
         --live) export DRY_RUN=false ;;
         --resume) export RESUME=true ;;
-        --priorities|--summary|--diagnose|--inspect) SUBCOMMAND="$1" ;;
+        --priorities|--summary|--diagnose|--inspect|--check-pr-failures) SUBCOMMAND="$1" ;;
         --routine) shift; export ROUTINE="$1" ;;
         --routine=*) export ROUTINE="${1#--routine=}" ;;
         --build) shift; SUBCOMMAND="--build"; BUILD_IDS+=("$1") ;;
         --build=*) SUBCOMMAND="--build"; BUILD_IDS+=("${1#--build=}") ;;
         *)
             echo "❌ Argomento non riconosciuto: $1"
-            echo "   Usa: --live | --resume | --routine <name|id> | --priorities | --summary | --inspect | --diagnose | --build <id>"
+            echo "   Usa: --live | --resume | --routine <name|id> | --priorities | --summary | --inspect | --diagnose | --check-pr-failures | --build <id>"
             exit 1
             ;;
     esac
@@ -83,6 +83,16 @@ if [[ "$SUBCOMMAND" == "--inspect" ]]; then
     [[ -n "$ROUTINE" ]] && echo "   (filtrato sulla routine: $ROUTINE)"
     cd "$SCRIPT_DIR"
     uv run inspect_builds.py
+    exit 0
+fi
+if [[ "$SUBCOMMAND" == "--check-pr-failures" ]]; then
+    echo "🔍 PR review check: controllo dei ticket mergiati contro Acceptance..."
+    [[ -n "$ROUTINE" ]] && echo "   (filtrato sulla routine: $ROUTINE)"
+    if [[ -z "$GITHUB_TOKEN" ]]; then
+        echo "ℹ️  GITHUB_TOKEN non impostato: le chiamate GitHub useranno il rate limit non autenticato (60 req/h)."
+    fi
+    cd "$SCRIPT_DIR"
+    uv run check_pr_failures.py
     exit 0
 fi
 if [[ "$SUBCOMMAND" == "--build" ]]; then

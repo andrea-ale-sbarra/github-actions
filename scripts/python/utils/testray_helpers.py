@@ -64,6 +64,9 @@ ANALYZED_ROUTINES = (
         # tagged via the previous setup remain reachable.
         "routine_label": os.getenv("ROUTINE_LABEL", "commerce_routine_tasks"),
         "out_rc_label": os.getenv("OUT_RC_LABEL", "commerce_out_rc"),
+        # Tickets flagged by the developer (cover image on the Jira board)
+        # to be cross-checked against Acceptance after the PR is merged.
+        "check_label": "commerce_check_failures",
     },
     {
         "id": USER_MANAGEMENT_ROUTINE_ID,
@@ -75,6 +78,7 @@ ANALYZED_ROUTINES = (
         "jira_component_override": "User Management",
         "routine_label": "um_routine_tasks",
         "out_rc_label": "um_out_rc",
+        "check_label": "um_check_failures",
     },
 )
 
@@ -165,7 +169,7 @@ def analyze_testflow(builds, routine_id):
         _CURRENT_ROUTINE_ID = previous_routine_id
 
 
-def print_slack_summary(routine_runs):
+def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
     """
     Print one Slack-ready recap covering every routine analyzed in this run.
 
@@ -174,13 +178,29 @@ def print_slack_summary(routine_runs):
     closure_summary slot is unused here (consumed by print_closure_report)
     but accepted so the same iterable can drive both reports. Routines whose
     task_id is None (no DONE build, dry-run, etc.) are skipped.
+
+    `pr_check_by_routine_id` (optional) maps routine id → list of PR check
+    result dicts (see `utils.pr_check.check_pr_failures_for_routine`). When
+    provided, a per-routine PR review block is appended to the recap.
     """
+    pr_check_by_routine_id = pr_check_by_routine_id or {}
+
+    # Local import: pr_check pulls in jira_helpers and testray_api, which is
+    # the same module set testray_helpers itself imports, but we keep the
+    # import lazy so callers that don't need the PR check (e.g. older
+    # print_slack_summary.py invocations) don't have to satisfy
+    # github_api's environment requirements.
+    from pr_check import format_pr_check_block
+
     blocks = []
     for entry in routine_runs:
         routine, task_id = entry[0], entry[1]
         if not task_id:
             continue
         blocks.extend(_format_routine_block(routine, task_id))
+        pr_results = pr_check_by_routine_id.get(routine["id"])
+        if pr_results:
+            blocks.extend(format_pr_check_block(routine, pr_results))
 
     if not blocks:
         return
