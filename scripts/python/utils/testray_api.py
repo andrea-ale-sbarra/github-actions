@@ -23,7 +23,10 @@ STATUS_FAILED_BLOCKED_TESTFIX = "FAILED,TESTFIX,BLOCKED"
 
 
 def testray_build_url(build_id):
-    return f"{TESTRAY_UI_URL}#/builds/{build_id}"
+    return (
+        f"{TESTRAY_UI_URL}#/project/{LIFERAY_PORTAL_PROJECT_ID}"
+        f"/routines/{ACCEPTANCE_ROUTINE_ID}/build/{build_id}"
+    )
 
 
 def testray_task_url(task_id):
