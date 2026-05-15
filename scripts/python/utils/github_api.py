@@ -18,6 +18,7 @@ from functools import lru_cache
 import requests
 from requests.exceptions import RequestException
 
+
 GITHUB_API = "https://api.github.com"
 
 
@@ -29,7 +30,9 @@ def get_compare(owner, repo, base, head):
             "html_url": str,
             "status": "ahead" | "behind" | "identical" | "diverged",
             "total_commits": int,
-            "files": [{"filename": str, "status": str}, ...],
+            "files": [
+                {"filename": str, "status": str, "patch": str | None}, ...
+            ],
             "truncated": bool,
             "head_commit_date": str | None,   # ISO 8601, committer date
         }
@@ -38,6 +41,11 @@ def get_compare(owner, repo, base, head):
     typical Liferay merge but we expose `truncated` so callers can warn
     when a merge is unusually large.
 
+    `patch` is the unified diff for the file (only present for text files
+    under GitHub's per-file size cap). Callers use it to inspect which
+    specific test() / it() blocks were touched, instead of treating every
+    test in a modified spec file as relevant.
+
     `head_commit_date` is the committer date of the last commit in the
     `base...head` range. Callers use it to find the first Acceptance
     build whose snapshot was taken *after* the merge landed on master.
@@ -45,18 +53,26 @@ def get_compare(owner, repo, base, head):
     url = f"{GITHUB_API}/repos/{owner}/{repo}/compare/{base}...{head}"
     payload = _get_json(url) or {}
     files = [
-        {"filename": f.get("filename"), "status": f.get("status")}
+        {
+            "filename": f.get("filename"),
+            "status": f.get("status"),
+            "patch": f.get("patch"),
+        }
         for f in (payload.get("files") or [])
     ]
+
+    # `commits` is ordered oldest-first; the last entry is `head`. If the
+    # range is empty (base == head) GitHub omits commits and we fall back
+    # to a dedicated commit lookup.
     commits = payload.get("commits") or []
     head_commit_date = None
     if commits:
         head_commit_date = (
-            (((commits[-1] or {}).get("commit") or {}).get("committer") or {})
-            .get("date")
-        )
+            ((commits[-1] or {}).get("commit") or {}).get("committer") or {}
+        ).get("date")
     if not head_commit_date:
         head_commit_date = _get_commit_committer_date(owner, repo, head)
+
     return {
         "html_url": payload.get("html_url"),
         "status": payload.get("status"),
@@ -73,7 +89,7 @@ def _get_commit_committer_date(owner, repo, sha):
         payload = _get_json(f"{GITHUB_API}/repos/{owner}/{repo}/commits/{sha}")
     except Exception:
         return None
-    return (((payload or {}).get("commit") or {}).get("committer") or {}).get("date")
+    return ((payload or {}).get("commit") or {}).get("committer", {}).get("date")
 
 
 @lru_cache(maxsize=4096)
@@ -98,7 +114,10 @@ def is_ancestor(owner, repo, ancestor_sha, descendant_sha):
     Cached: a (ancestor, descendant) verdict is immutable, and the PR
     review check tends to revisit the same pairs across tickets / runs.
     """
-    url = f"{GITHUB_API}/repos/{owner}/{repo}/compare/{ancestor_sha}...{descendant_sha}"
+    url = (
+        f"{GITHUB_API}/repos/{owner}/{repo}/compare/"
+        f"{ancestor_sha}...{descendant_sha}"
+    )
     try:
         payload = _get_json(url) or {}
     except requests.HTTPError as e:
@@ -114,6 +133,8 @@ def _get_json(url, max_retries=3):
     for attempt in range(max_retries):
         try:
             response = requests.get(url, headers=_get_headers(), timeout=30)
+
+            # Rate limit: respect GitHub's reset hint when possible.
             if response.status_code == 403 and "rate limit" in response.text.lower():
                 reset = response.headers.get("X-RateLimit-Reset")
                 wait = 30
@@ -122,27 +143,28 @@ def _get_json(url, max_retries=3):
                 print(f"⚠ GitHub rate limit hit, sleeping {wait}s before retry...")
                 time.sleep(min(wait, 120))
                 continue
+
             response.raise_for_status()
             return response.json()
         except RequestException as e:
             last_exception = e
+            # 4xx responses are final — retrying won't change the server's
+            # answer and just delays the caller. `is_ancestor` relies on
+            # 404 being raised fast so it can return False without burning
+            # ~15s of back-off per missing SHA.
             status = getattr(getattr(e, "response", None), "status_code", None)
             if status and 400 <= status < 500:
-                raise
+                break
             if attempt < max_retries - 1:
                 wait = (attempt + 1) * 5
-                print(
-                    f"GitHub GET attempt {attempt + 1} failed ({e}). "
-                    f"Retrying in {wait}s..."
-                )
+                print(f"GitHub GET attempt {attempt + 1} failed ({e}). Retrying in {wait}s...")
                 time.sleep(wait)
             else:
                 print(f"All GitHub retries exhausted for {url}.")
+
     if last_exception:
         raise last_exception
-    raise RuntimeError(
-        f"Failed to fetch JSON from {url} after {max_retries} attempts."
-    )
+    raise RuntimeError(f"Failed to fetch JSON from {url} after {max_retries} attempts.")
 
 
 @lru_cache()
@@ -156,7 +178,7 @@ def _get_headers():
         headers["Authorization"] = f"Bearer {token}"
     else:
         print(
-            "⚠ GITHUB_TOKEN not set: GitHub API calls will be rate-limited "
-            "to 60 req/h. Add a personal access token to .env to lift this."
+            "⚠ GITHUB_TOKEN not set: GitHub API calls will be rate-limited to "
+            "60 req/h. Add a personal access token to .env to lift this."
         )
     return headers

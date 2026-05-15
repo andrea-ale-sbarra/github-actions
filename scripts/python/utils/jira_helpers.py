@@ -272,17 +272,27 @@ def get_issue_type_by_key(issue_key):
 
 def get_issue_status_by_key(issue_key):
     """
-    Retrieves the issue by key and returns its status name.
+    Retrieves the issue by key and returns its status name plus the
+    status-category key.
+
+    The category key (``"new"`` / ``"indeterminate"`` / ``"done"``) is
+    locale-independent — unlike ``status.name``, which Jira renders in the
+    requesting account's language and would return e.g. ``"Chiusa"`` for an
+    Italian-localized bot. Callers that need to detect "this ticket is in a
+    terminal state" should compare against the category, not the name.
 
     :param issue_key: The key of the issue (e.g., "LPD-12345").
-    :return: Tuple (issue, status_name) if found, else (None, None)
+    :return: Tuple (issue, status_name, status_category_key) if found,
+             else (None, None, None)
     """
     try:
         issue = _jira().issue(issue_key, fields="status")
-        return issue, issue.fields.status.name
+        status = issue.fields.status
+        category_key = getattr(getattr(status, "statusCategory", None), "key", None)
+        return issue, status.name, category_key
     except Exception as e:
         print(f"Error retrieving issue {issue_key}: {str(e)}")
-        return None, None
+        return None, None, None
 
 
 def _transition_to_closed(issue_key, build_hash):

@@ -19,7 +19,7 @@ For every Jira ticket carrying the routine's `check_label` (`commerce_check_fail
      in that build and reports each one's status (PASSED / FAILED /
      BLOCKED / NOT FOUND).
 
-The output is plain-text and ready to copy-paste. Used both by the main run
+The output is purely read-only and Slack-ready. Used both by the main run
 (`analyze_testray_results.py`) and the standalone command
 (`check_pr_failures.py`).
 """
@@ -28,45 +28,99 @@ import os
 import re
 import sys
 
+# Make sibling modules in this `utils/` package importable bare (the rest
+# of the project pulls them this way; see testray_helpers.py for the same
+# pattern). Doing it here lets pr_check be imported in any order without
+# depending on testray_helpers having been loaded first.
 sys.path.append(os.path.dirname(__file__))
 
 from jira_helpers import get_all_issues, jira_issue_url
 from testray_api import (
-    ACCEPTANCE_ROUTINE_ID,
-    LIFERAY_PORTAL_PROJECT_ID,
     find_case_by_exact_name,
     find_case_result_in_build_via_history,
     find_cases_by_name_substring,
     get_routine_to_builds,
     testray_build_url,
     testray_case_result_url,
+    ACCEPTANCE_ROUTINE_ID,
+    LIFERAY_PORTAL_PROJECT_ID,
 )
 from github_api import get_compare, is_ancestor
 
+# Acceptance runs on the upstream Liferay portal repo; ancestry checks
+# against the build's `gitHash` therefore go through this owner/repo.
+# Brian's fork and liferay-commerce fast-forward into upstream, so a
+# `head_sha` taken from a fork's compare URL exists here under the same
+# SHA once the merge has propagated.
 _UPSTREAM_OWNER = "liferay"
 _UPSTREAM_REPO = "liferay-portal"
 
+
+# The final reviewer's "Merged. Thank you." message contains a hyperlinked
+# `View total diff: <base>...<head>` snippet that points at GitHub's
+# compare view on their fork. That URL is the single source of truth for
+# this check — it identifies the merge, the HEAD SHA, and (via the
+# compare endpoint) the files that landed.
 _COMPARE_URL_RE = re.compile(
     r"https?://github\.com/([^/\s]+)/([^/\s]+)/compare/"
     r"([0-9a-f]{4,40})\.{2,3}([0-9a-f]{4,40})",
     re.IGNORECASE,
 )
+
+# Heuristics that pick test files out of the merge diff. Covers:
+#   • Java integration / unit:   *Test.java, *IT.java, or any file under
+#                                /src/test/ or /src/testIntegration/
+#   • Playwright / Jest / Vitest: *.spec.{ts,tsx,js,jsx,mjs},
+#                                 *.test.{ts,tsx,js,jsx,mjs},
+#                                 or any file under /playwright/ /e2e/ /tests/
+#   • Poshi (Liferay):           *.testcase
 _TEST_FILENAME_RE = re.compile(
-    r"(?:(?:Test|IT)\.java|\.(?:spec|test)\.(?:ts|tsx|js|jsx|mjs)|\.testcase)$"
+    r"(?:"
+    r"(?:Test|IT)\.java"          # Java integration/unit
+    r"|\.(?:spec|test)\.(?:ts|tsx|js|jsx|mjs)"   # JS/TS test runners
+    r"|\.testcase"                # Poshi
+    r")$"
 )
 _TEST_PATH_HINTS = (
-    "/src/test/",
-    "/src/testIntegration/",
-    "/test/integration/",
-    "/playwright/",
-    "/e2e/",
-    "/tests/e2e/",
+    "/src/test/", "/src/testIntegration/", "/test/integration/",
+    "/playwright/", "/e2e/", "/tests/e2e/",
 )
-_STRIPPABLE_EXTENSIONS = (".java", ".testcase", ".tsx", ".ts", ".jsx", ".js", ".mjs")
+
+# Extensions stripped from a non-Java test filename to build the Testray
+# case-name substring. Order matters: longest first so
+# `productEditor.spec.ts` loses only `.ts` and the remaining
+# `productEditor.spec` is what we query.
+_STRIPPABLE_EXTENSIONS = (
+    ".java", ".testcase", ".tsx", ".ts", ".jsx", ".js", ".mjs",
+)
+
+# Java tests under the Maven/Gradle layout: capture the dotted FQN out
+# of the path so we can ask Testray for an *exact* case-name match.
 _JAVA_FQN_PATH_RE = re.compile(
     r"/src/(?:test|testIntegration|main)/java/(.+)\.java$"
 )
 
+# Playwright / Jest / Vitest spec files. For these we don't want to match
+# every test in the file — we want only the test() / it() / describe()
+# blocks referenced in the diff, because Testray names each case after
+# the test description (e.g. "productDetails.spec.ts > LPD-39598 ...").
+_JS_TEST_FILENAME_RE = re.compile(
+    r"\.(?:spec|test)\.(?:ts|tsx|js|jsx|mjs)$"
+)
+
+# test('name', …) / it('name', …) / test.describe('name', …) / it.each(…)
+# with single, double, or back-tick quotes. Captures the description so
+# the caller can use it as the Testray case-name substring.
+_JS_TEST_BLOCK_RE = re.compile(
+    r"""\b(?:test|it)(?:\.[A-Za-z_][A-Za-z_0-9]*)?\s*\(\s*"""
+    r"""(['"`])(.+?)\1""",
+    re.DOTALL,
+)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def check_pr_failures_for_routine(routine):
     """Run the PR review check for one routine.
@@ -78,15 +132,26 @@ def check_pr_failures_for_routine(routine):
     label = routine.get("check_label")
     if not label:
         return []
-    print(f"\n=== PR review check: routine '{routine['name']}' (label={label}) ===\n")
+
+    print(
+        f"\n=== PR review check: routine '{routine['name']}' "
+        f"(label={label}) ===\n"
+    )
+
     issues = _fetch_tagged_issues(label)
     if not issues:
         print(f"  (no Jira tickets carry the '{label}' label)")
         return []
+
     print(f"  Found {len(issues)} ticket(s) to check.\n")
+
+    # Acceptance returns the same list of builds for every ticket; fetch
+    # it once and reuse it (the call paginates through hundreds of builds
+    # and takes a few seconds).
     print("  Loading Acceptance build list (one-shot for all tickets)...", flush=True)
     builds_cache = get_routine_to_builds(ACCEPTANCE_ROUTINE_ID) or []
     print(f"  → {len(builds_cache)} Acceptance build(s) loaded.\n", flush=True)
+
     results = []
     for issue in issues:
         result = _check_ticket(issue, builds_cache)
@@ -102,42 +167,55 @@ def format_pr_check_block(routine, results):
     """
     if not results:
         return []
-    lines = [f"{routine['name']} — PR review check"]
+
+    lines = [f"{routine['name']} - PR review check"]
+
     for r in results:
         ticket_line = (
-            f"• {r['ticket_key']} ({r['ticket_url']}) {r['ticket_summary']}"
+            f"- {r['ticket_key']} ({r['ticket_url']}): {r['ticket_summary']}"
         )
+
         if r["status"] == "skipped":
             reason = _SKIP_REASON_LABELS.get(r["skip_reason"], r["skip_reason"])
-            ticket_line += f" — skipped: {reason}"
+            ticket_line += f" - skipped: {reason}"
+            # Surface whatever we did collect before giving up; helps the
+            # reader spot e.g. "wait, the SHA should be in Acceptance".
             diag = []
             if r.get("compare_url"):
                 diag.append(f"merge diff: {r['compare_url']}")
             if r.get("commit_sha"):
-                diag.append(f"SHA `{r['commit_sha'][:12]}`")
+                diag.append(f"SHA {r['commit_sha'][:12]}")
             if diag:
-                ticket_line += " (" + " · ".join(diag) + ")"
+                ticket_line += " (" + " | ".join(diag) + ")"
             lines.append(ticket_line)
             continue
+
         sha_short = (r.get("commit_sha") or "")[:12] or "?"
         compare_url = r.get("compare_url") or ""
         build_url = r.get("build_url") or ""
         build_id = r.get("build_id")
+
         meta_parts = []
         if compare_url:
             meta_parts.append(f"merge diff: {compare_url}")
-        meta_parts.append(f"SHA `{sha_short}`")
+        meta_parts.append(f"SHA {sha_short}")
         if build_url:
             meta_parts.append(f"Acceptance build {build_id}: {build_url}")
-        lines.append(ticket_line + " — " + " · ".join(meta_parts))
+        lines.append(ticket_line + " - " + " | ".join(meta_parts))
+
         for tr in r["test_results"]:
-            icon = _STATUS_ICON.get(tr["status"], "•")
+            status = tr["status"]
+            label = f"[{status}]"
             if tr.get("caseresult_url"):
-                lines.append(f"    {icon} {tr['case_name']} — {tr['caseresult_url']}")
+                lines.append(
+                    f"    {label} {tr['case_name']} ({tr['caseresult_url']})"
+                )
             else:
-                lines.append(f"    {icon} {tr['case_name']}")
+                lines.append(f"    {label} {tr['case_name']}")
+
         if not r["test_results"]:
             lines.append("    (no matching test cases found in the build)")
+
     lines.append("")
     return lines
 
@@ -151,36 +229,34 @@ def print_pr_check_standalone(pr_check_by_routine):
     blocks = []
     for routine, results in pr_check_by_routine:
         blocks.extend(format_pr_check_block(routine, results))
+
     if not blocks:
         print("\n(no routine had any ticket tagged for PR review check)")
         return
+
     message = "\n".join(
         [
             "Hi all,",
             "",
-            "PR review check — status of the tests touched by the merged PRs:",
+            "PR review check - status of the tests touched by the merged PRs:",
             "",
             *blocks,
             "Thanks!",
         ]
     )
-    separator = "──────────────────────────────────────────────────────────────────────"
+
+    separator = "-" * 70
     print()
     print(separator)
-    print("PR check report (copy-paste the block below):")
+    print("Plain-text PR check (copy-paste below):")
     print(separator)
     print(message)
     print(separator)
 
 
-_STATUS_ICON = {
-    "PASSED": "✓",
-    "FAILED": "✗",
-    "TESTFIX": "✗",
-    "BLOCKED": "⚠",
-    "UNTESTED": "○",
-    "NOT FOUND": "○",
-}
+# ---------------------------------------------------------------------------
+# Internals
+# ---------------------------------------------------------------------------
 
 _SKIP_REASON_LABELS = {
     "no_merge_diff": "no 'View total diff' link found on the ticket",
@@ -192,7 +268,8 @@ _SKIP_REASON_LABELS = {
 
 def _fetch_tagged_issues(label):
     jql = (
-        f'project = LPD AND labels = "{label}" AND status != "Closed" '
+        f'project = LPD AND labels = "{label}" '
+        f'AND statusCategory != Done '
         f"ORDER BY updated DESC"
     )
     return get_all_issues(jql, fields="summary,comment,labels,status")
@@ -231,6 +308,7 @@ def _check_ticket(issue, builds_cache):
         "build_url": None,
         "test_results": [],
     }
+
     print(f"\n  ▶ {key}: {summary}", flush=True)
 
     diff = _extract_merge_diff_from_issue(issue)
@@ -238,16 +316,19 @@ def _check_ticket(issue, builds_cache):
         print("    · no 'View total diff' link in comments — skip", flush=True)
         base["skip_reason"] = "no_merge_diff"
         return base
+
     owner, repo, base_sha, head_sha = diff
-    base["compare_url"] = f"https://github.com/{owner}/{repo}/compare/{base_sha}...{head_sha}"
+    base["compare_url"] = (
+        f"https://github.com/{owner}/{repo}/compare/{base_sha}...{head_sha}"
+    )
     base["commit_sha"] = head_sha
     print(
         f"    · merge diff: {owner}/{repo} {base_sha[:7]}...{head_sha[:7]}",
         flush=True,
     )
 
-    print("    · calling GitHub compare API for files + commit date...", flush=True)
     try:
+        print("    · calling GitHub compare API for files + commit date...", flush=True)
         cmp_info = get_compare(owner, repo, base_sha, head_sha)
     except Exception as e:
         print(f"    ✘ GitHub error: {e}", flush=True)
@@ -271,6 +352,11 @@ def _check_ticket(issue, builds_cache):
         base["skip_reason"] = "no_test_files"
         return base
 
+    # Acceptance doesn't run on every commit — it samples master at
+    # scheduled intervals. The relevant build for this merge is the
+    # earliest DONE build whose snapshot includes the merge commit, which
+    # we verify by asking GitHub whether `head_sha` is reachable from the
+    # build's `gitHash`.
     commit_date = cmp_info.get("head_commit_date")
     print(
         f"    · finding earliest DONE Acceptance build containing "
@@ -282,8 +368,8 @@ def _check_ticket(issue, builds_cache):
     )
     if not build_id:
         print(
-            "    · no Acceptance build whose gitHash contains the merge "
-            "yet — skip",
+            "    · no Acceptance build whose gitHash contains the merge yet "
+            "— skip",
             flush=True,
         )
         base["skip_reason"] = "build_not_found"
@@ -292,8 +378,11 @@ def _check_ticket(issue, builds_cache):
     base["build_id"] = build_id
     base["build_url"] = testray_build_url(build_id)
     print(f"    · matched Acceptance build {build_id} → {base['build_url']}", flush=True)
-    print(f"    · looking up test cases in build {build_id} (targeted query)...", flush=True)
 
+    print(
+        f"    · looking up test cases in build {build_id} (targeted query)...",
+        flush=True,
+    )
     base["test_results"] = _collect_test_results(build_id, test_search_names)
     base["status"] = "checked"
     base["skip_reason"] = None
@@ -305,11 +394,16 @@ def _extract_merge_diff_from_issue(issue):
     Jira comment containing a GitHub `compare/<base>...<head>` URL, or
     `None`.
     """
+    comments = []
     try:
         comments = list(getattr(issue.fields, "comment", None).comments or [])
     except AttributeError:
         comments = []
+
+    # Newest first: if a ticket was merged in multiple rounds, we want the
+    # latest "Merged. Thank you." message.
     comments.sort(key=lambda c: getattr(c, "created", "") or "", reverse=True)
+
     for c in comments:
         body = _comment_body_text(c)
         if not body:
@@ -350,6 +444,7 @@ def _adf_to_text(node):
         return node
     if not isinstance(node, dict):
         return ""
+
     parts = []
     if node.get("type") == "text":
         parts.append(node.get("text", ""))
@@ -372,27 +467,41 @@ def _derive_test_search_names(changed_files):
         `/src/testIntegration/java/...`) yield the dotted FQN with
         `is_exact=True`. Testray names these cases by the FQN, so we
         can match exactly without ambiguity.
-      • Anything else (Playwright spec, Jest test, Poshi `.testcase`)
-        yields the filename stem (extension stripped) with
-        `is_exact=False`. The Testray naming convention for non-Java
-        tests varies, so the caller will use a substring filter and
-        accept a small chance of multiple matches.
+      • Playwright / Jest / Vitest spec files yield ONE entry per
+        `test()` / `it()` / `describe()` block referenced in the patch
+        (added, removed, or context). Testray names these cases as
+        `<spec_path> > <test description>`, so searching by the test
+        description finds the specific case in the diff instead of
+        every test that happens to live in the same spec file. Spec
+        files whose patch surfaces no `test()` block are skipped — we
+        intentionally avoid the broader filename-stem fallback so the
+        report stays scoped to the PR's actual diff.
+      • Anything else (Poshi `.testcase`, etc.) yields the filename
+        stem (extension stripped) with `is_exact=False`.
     """
     names = set()
     for f in changed_files:
         filename = (f.get("filename") or "").strip()
         if not filename:
             continue
+
         looks_like_test = bool(_TEST_FILENAME_RE.search(filename)) or any(
             hint in filename for hint in _TEST_PATH_HINTS
         )
         if not looks_like_test:
             continue
+
         fqn_match = _JAVA_FQN_PATH_RE.search(filename)
         if fqn_match:
             fqn = fqn_match.group(1).replace("/", ".")
             names.add((fqn, True))
             continue
+
+        if _JS_TEST_FILENAME_RE.search(filename):
+            for desc in _extract_js_test_descriptions(f.get("patch") or ""):
+                names.add((desc, False))
+            continue
+
         base = filename.rsplit("/", 1)[-1]
         for ext in _STRIPPABLE_EXTENSIONS:
             if base.endswith(ext):
@@ -401,6 +510,47 @@ def _derive_test_search_names(changed_files):
         if base:
             names.add((base, False))
     return names
+
+
+def _extract_js_test_descriptions(patch_text):
+    """Return the set of `test()` / `it()` descriptions present in the patch.
+
+    We look at:
+      - every patch line whose first character is `+`, `-`, or a space
+        (i.e. added, removed, and context lines), skipping the file
+        headers `+++ b/...` and `--- a/...`;
+      - hunk header lines `@@ … @@ <context>`, because GitHub records
+        the enclosing function declaration there and a body-only edit
+        may surface its `test('…', () => {` only through that header.
+
+    Mentioning the description on any side of the diff is enough.
+
+    Returns descriptions verbatim. The caller does a substring match in
+    Testray, so we don't need to compose the full `<path> > <desc>` name.
+    """
+    if not patch_text:
+        return set()
+
+    descriptions = set()
+    for line in patch_text.split("\n"):
+        if not line:
+            continue
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("@@"):
+            # Hunk header: strip the `@@ -a,b +c,d @@` prefix, scan the rest.
+            tail = re.split(r"@@\s?", line, maxsplit=2)
+            body = tail[-1] if tail else ""
+        else:
+            prefix = line[0]
+            if prefix not in ("+", "-", " "):
+                continue
+            body = line[1:]
+        for match in _JS_TEST_BLOCK_RE.finditer(body):
+            desc = (match.group(2) or "").strip()
+            if desc:
+                descriptions.add(desc)
+    return descriptions
 
 
 def _find_first_acceptance_build_containing(head_sha, commit_date, builds):
@@ -429,9 +579,9 @@ def _find_first_acceptance_build_containing(head_sha, commit_date, builds):
     """
     if not commit_date:
         return None
+
     candidates = [
-        b
-        for b in builds
+        b for b in builds
         if (b.get("dueDate") or "") >= commit_date
         and (b.get("importStatus") or {}).get("key") == "DONE"
         and b.get("gitHash")
@@ -439,11 +589,14 @@ def _find_first_acceptance_build_containing(head_sha, commit_date, builds):
     if not candidates:
         return None
     candidates.sort(key=lambda b: b.get("dueDate") or "")
+
     for b in candidates:
         git_hash = b["gitHash"]
         build_id = b.get("id")
         try:
-            contains = is_ancestor(_UPSTREAM_OWNER, _UPSTREAM_REPO, head_sha, git_hash)
+            contains = is_ancestor(
+                _UPSTREAM_OWNER, _UPSTREAM_REPO, head_sha, git_hash
+            )
         except Exception as e:
             print(
                 f"    · ancestry check failed for build {build_id} "
@@ -459,6 +612,7 @@ def _find_first_acceptance_build_containing(head_sha, commit_date, builds):
             f"{head_sha[:7]}; trying next",
             flush=True,
         )
+
     return None
 
 
@@ -484,20 +638,28 @@ def _collect_test_results(build_id, test_search_names):
     """
     if not test_search_names:
         return []
-    out_by_name = {}
+
+    out_by_name = {}    # case_name → row dict
     matched_inputs = set()
+
     for name, is_exact in sorted(test_search_names):
-        print(f"    · resolving Testray case for '{name}' (exact={is_exact})...", flush=True)
+        print(
+            f"    · resolving Testray case for '{name}' (exact={is_exact})...",
+            flush=True,
+        )
         cases = []
         if is_exact:
             case = find_case_by_exact_name(name)
             if case:
                 cases = [case]
         if not cases:
+            # No exact hit (or non-Java input): fall back to substring on
+            # the simple class name / file stem.
             substring = name.rsplit(".", 1)[-1] if is_exact else name
             cases = find_cases_by_name_substring(substring)
         if not cases:
             continue
+
         for case in cases:
             case_id = case.get("id")
             case_name = case.get("name") or ""
@@ -506,10 +668,15 @@ def _collect_test_results(build_id, test_search_names):
             if case_name in out_by_name:
                 matched_inputs.add((name, is_exact))
                 continue
+
             cr = find_case_result_in_build_via_history(build_id, case_id)
             if not cr:
+                # Case exists but didn't run in this build. Still count
+                # the input as matched — we don't also want a NOT FOUND
+                # row for it below.
                 matched_inputs.add((name, is_exact))
                 continue
+
             status = ((cr.get("dueStatus") or {}).get("name") or "UNTESTED").upper()
             case_result_id = cr.get("id")
             caseresult_url = None
@@ -526,9 +693,17 @@ def _collect_test_results(build_id, test_search_names):
                 "caseresult_url": caseresult_url,
             }
             matched_inputs.add((name, is_exact))
+
     out = list(out_by_name.values())
     for name, _is_exact in sorted(test_search_names - matched_inputs):
-        out.append({"case_name": name, "status": "NOT FOUND", "caseresult_url": None})
+        out.append(
+            {
+                "case_name": name,
+                "status": "NOT FOUND",
+                "caseresult_url": None,
+            }
+        )
+
     out.sort(key=lambda e: (e["status"] != "FAILED", e["case_name"]))
     return out
 
@@ -539,11 +714,12 @@ def _log_ticket_result(r):
         reason = _SKIP_REASON_LABELS.get(r["skip_reason"], r["skip_reason"])
         print(f"  - {key}: skipped ({reason})")
         return
+
     counts = {}
     for tr in r["test_results"]:
         counts[tr["status"]] = counts.get(tr["status"], 0) + 1
     pretty = ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "no matching cases"
     print(
-        f"  - {key}: build {r['build_id']} "
-        f"(SHA {(r.get('commit_sha') or '')[:12]}) → {pretty}"
+        f"  - {key}: build {r['build_id']} (SHA {(r['commit_sha'] or '')[:12]}) "
+        f"→ {pretty}"
     )

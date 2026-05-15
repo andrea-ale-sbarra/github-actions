@@ -171,17 +171,33 @@ def analyze_testflow(builds, routine_id):
 
 def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
     """
-    Print one Slack-ready recap covering every routine analyzed in this run.
+    Print one plain-text recap covering every routine analyzed in this run.
 
-    `routine_runs` is an iterable of (routine_config, task_id, closure_summary)
-    tuples, where routine_config is an entry from ANALYZED_ROUTINES. The
-    closure_summary slot is unused here (consumed by print_closure_report)
-    but accepted so the same iterable can drive both reports. Routines whose
-    task_id is None (no DONE build, dry-run, etc.) are skipped.
+    The output is structured as four sections, in order:
 
-    `pr_check_by_routine_id` (optional) maps routine id → list of PR check
-    result dicts (see `utils.pr_check.check_pr_failures_for_routine`). When
-    provided, a per-routine PR review block is appended to the recap.
+      1. Open Jira tickets per routine (with the Testray analysis task
+         link and the per-component JQL URLs).
+      2. Closing suggestion + "Thanks!".
+      3. Closure report — tickets auto-closed as not reproducible during
+         this run (only present when the run is invoked with closure
+         summaries, i.e. through `analyze_testray_results.py`).
+      4. Test analysis — PR review check, listing the tests Testray ran
+         for each merged ticket carrying the routine's `check_label`.
+
+    `routine_runs` is an iterable of (routine_config, task_id) or
+    (routine_config, task_id, closure_summary) tuples, where
+    routine_config is an entry from ANALYZED_ROUTINES. closure_summary
+    may be None (no closure attempt) or a dict
+    {build_id, build_hash, attempted, closed} from
+    _close_stale_routine_tasks. Routines whose task_id is None (no DONE
+    build, dry-run, etc.) are skipped.
+
+    `pr_check_by_routine_id` (optional) maps routine id → list of PR
+    check result dicts (see `utils.pr_check.check_pr_failures_for_routine`).
+    When provided, the "test analysis" section is appended at the end.
+
+    No Slack mrkdwn is emitted: links are rendered as plain URLs so the
+    block can be copy-pasted into any chat client without rewriting.
     """
     pr_check_by_routine_id = pr_check_by_routine_id or {}
 
@@ -192,54 +208,68 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
     # github_api's environment requirements.
     from pr_check import format_pr_check_block
 
-    blocks = []
-    for entry in routine_runs:
-        routine, task_id = entry[0], entry[1]
-        if not task_id:
-            continue
-        blocks.extend(_format_routine_block(routine, task_id))
-        pr_results = pr_check_by_routine_id.get(routine["id"])
-        if pr_results:
-            blocks.extend(format_pr_check_block(routine, pr_results))
-
-    if not blocks:
+    active_runs = [entry for entry in routine_runs if entry[1]]
+    if not active_runs:
         return
 
-    message = "\n".join(
-        [
-            "Hi all,",
-            "",
-            "The routine test analysis run just finished and the "
-            "investigation tickets are ready for review.",
-            "",
-            *blocks,
-            "A quick suggestion: have a look to check that recent PRs "
-            "aren't the cause of the failures, then kick off a Claude "
-            ":claude: task to either fix a failing test, convert a Poshi "
-            "test, or fix a real bug. The more we chip away at these, "
-            "the cleaner our acceptance and commerce routines will be — "
-            "which makes it much easier to spot real bugs and ship new "
-            "releases :rocket:",
-            "",
-            "Thanks!",
-        ]
-    )
+    section1 = []
+    for entry in active_runs:
+        routine, task_id = entry[0], entry[1]
+        section1.extend(_format_routine_block(routine, task_id))
 
-    separator = "─" * 70
+    section2 = [
+        "A quick suggestion: have a look to check that recent PRs aren't "
+        "the cause of the failures, then kick off a Claude task to either "
+        "fix a failing test, convert a Poshi test, or fix a real bug. The "
+        "more we chip away at these, the cleaner our acceptance and "
+        "commerce routines will be - which makes it much easier to spot "
+        "real bugs and ship new releases.",
+        "",
+        "Thanks!",
+        "",
+    ]
+
+    section3 = _format_closure_report_lines(routine_runs)
+
+    section4 = []
+    pr_blocks = []
+    for entry in active_runs:
+        routine = entry[0]
+        pr_results = pr_check_by_routine_id.get(routine["id"])
+        if pr_results:
+            pr_blocks.extend(format_pr_check_block(routine, pr_results))
+    if pr_blocks:
+        section4 = ["Test analysis - PRs reviewed and merged:", ""]
+        section4.extend(pr_blocks)
+
+    lines = [
+        "Hi all,",
+        "",
+        "The routine test analysis run just finished and the "
+        "investigation tickets are ready for review.",
+        "",
+        *section1,
+        *section2,
+        *section3,
+        *section4,
+    ]
+
+    message = "\n".join(lines)
+    separator = "-" * 70
     print()
     print(separator)
-    print("Slack-ready summary (copy-paste the block below):")
+    print("Plain-text summary (copy-paste below):")
     print(separator)
     print(message)
     print(separator)
 
 
 def _format_routine_block(routine, task_id):
-    """Build the lines that describe one routine inside the Slack summary."""
+    """Build the lines that describe one routine inside the summary."""
     routine_label = routine["routine_label"]
     testray_url = f"https://testray.liferay.com/web/testray#/testflow/{task_id}"
     lines = [
-        f"*{routine['name']}*",
+        f"{routine['name']}",
         f"Testray analysis task: {testray_url}",
     ]
 
@@ -249,7 +279,7 @@ def _format_routine_block(routine, task_id):
         for component in components:
             jql = (
                 f'labels = "{routine_label}" '
-                f'AND status != "Closed" '
+                f'AND statusCategory != Done '
                 f'AND component = "{component}" '
                 f"ORDER BY priority DESC"
             )
@@ -258,7 +288,7 @@ def _format_routine_block(routine, task_id):
     else:
         jql = (
             f'labels = "{routine_label}" '
-            f'AND status != "Closed" '
+            f'AND statusCategory != Done '
             f"ORDER BY priority DESC"
         )
         url = f"https://liferay.atlassian.net/issues/?jql={quote_plus(jql)}"
@@ -268,34 +298,38 @@ def _format_routine_block(routine, task_id):
     return lines
 
 
-def print_closure_report(routine_runs, recent_build_window=20):
-    """
-    Per-routine recap of tickets closed by stale-closure during this run.
+def _format_closure_report_lines(routine_runs, recent_build_window=20):
+    """Return the plain-text closure-report lines (empty if nothing to report).
 
-    `routine_runs` is an iterable of (routine_config, task_id, closure_summary)
-    tuples. closure_summary may be None (no closure attempt) or a dict
-    {build_id, build_hash, attempted, closed} from _close_stale_routine_tasks.
+    For each routine that closed tickets in this run, the report
+    cross-checks the build SHA cited in the closure comment against the
+    most recent N builds of every other routine in ANALYZED_ROUTINES.
+    If the same SHA is also present in another routine's recent builds,
+    the report flags it as SHA-ambiguous - same diagnostic check as
+    diagnose_closed_commerce_tickets.py, but scoped to what this run
+    just closed.
 
-    For each routine that closed tickets, the report cross-checks the build
-    SHA that was cited in the closure comment against the most recent N
-    builds of every other routine in ANALYZED_ROUTINES. If the same SHA is
-    also present in another routine's recent builds, flags it as ambiguous
-    — same diagnostic check as diagnose_closed_commerce_tickets.py, but
-    scoped to what this run just closed.
+    Accepts both 2-tuples (routine, task_id) and 3-tuples (..., closure_summary).
     """
-    actionable = [
-        (r, s) for (r, _tid, s) in routine_runs
-        if s and s.get("closed")
-    ]
+    actionable = []
+    for entry in routine_runs:
+        if len(entry) < 3:
+            continue
+        routine, _tid, summary = entry[0], entry[1], entry[2]
+        if summary and summary.get("closed"):
+            actionable.append((routine, summary))
+
     if not actionable:
-        return
+        return []
 
     sha_index_by_routine = {}
     for routine in ANALYZED_ROUTINES:
         try:
             builds = get_routine_to_builds(routine["id"])[:recent_build_window]
         except Exception as e:
-            print(f"⚠ Could not fetch builds for {routine['name']} cross-check: {e}")
+            print(
+                f"Could not fetch builds for {routine['name']} cross-check: {e}"
+            )
             builds = []
         sha_index_by_routine[routine["id"]] = {
             b.get("gitHash"): (b["id"], b.get("name"))
@@ -303,11 +337,10 @@ def print_closure_report(routine_runs, recent_build_window=20):
             if b.get("gitHash")
         }
 
-    separator = "─" * 70
-    print()
-    print(separator)
-    print("Closure report — tickets closed by this run as 'not reproducible':")
-    print(separator)
+    lines = [
+        "Closure report - tickets closed by this run as 'not reproducible':",
+        "",
+    ]
 
     for routine, summary in actionable:
         sha = summary.get("build_hash")
@@ -317,9 +350,8 @@ def print_closure_report(routine_runs, recent_build_window=20):
         attempted = summary.get("attempted", [])
         skipped = [k for k in attempted if k not in closed]
 
-        print(f"\n*{routine['name']}*  build {build_id} (SHA {sha_short})")
+        lines.append(f"{routine['name']}  build {build_id} (SHA {sha_short})")
 
-        # Cross-check: SHA presence in OTHER routines' recent builds.
         others_with_sha = []
         for other in ANALYZED_ROUTINES:
             if other["id"] == routine["id"]:
@@ -330,29 +362,51 @@ def print_closure_report(routine_runs, recent_build_window=20):
                 others_with_sha.append((other["name"], bid, bname))
 
         if not sha:
-            print("  ⚠ No build SHA recorded for this closure batch.")
+            lines.append("  No build SHA recorded for this closure batch.")
         elif others_with_sha:
             for name, bid, bname in others_with_sha:
-                print(
-                    f"  ⚠ SHA also present in {name} build {bid} "
-                    f"({bname}) — closures are SHA-ambiguous; "
+                lines.append(
+                    f"  SHA also present in {name} build {bid} "
+                    f"({bname}) - closures are SHA-ambiguous; "
                     "verify by closure timestamp if needed."
                 )
         else:
-            print(
-                f"  ✓ SHA only present in {routine['name']}'s recent "
-                f"{recent_build_window} builds — closures are unambiguous."
+            lines.append(
+                f"  SHA only present in {routine['name']}'s recent "
+                f"{recent_build_window} builds - closures are unambiguous."
             )
 
-        print(f"  Closed ({len(closed)}):")
+        lines.append(f"  Closed ({len(closed)}):")
         for key in closed:
-            print(f"    - {key}  {jira_issue_url(key)}")
+            lines.append(f"    - {key}  {jira_issue_url(key)}")
 
         if skipped:
-            print(f"  Attempted but NOT closed ({len(skipped)}) — see logs above:")
+            lines.append(
+                f"  Attempted but NOT closed ({len(skipped)}) - see logs above:"
+            )
             for key in skipped:
-                print(f"    - {key}  {jira_issue_url(key)}")
+                lines.append(f"    - {key}  {jira_issue_url(key)}")
 
+        lines.append("")
+
+    return lines
+
+
+def print_closure_report(routine_runs, recent_build_window=20):
+    """Backwards-compatible wrapper that prints the closure report on its own.
+
+    The combined summary in `print_slack_summary` already includes the
+    closure section, so the standard run no longer needs this function.
+    Kept as a thin print() of `_format_closure_report_lines` for any
+    standalone caller that still relies on it.
+    """
+    out = _format_closure_report_lines(routine_runs, recent_build_window)
+    if not out:
+        return
+    separator = "-" * 70
+    print()
+    print(separator)
+    print("\n".join(out).rstrip())
     print(separator)
 
 
@@ -924,7 +978,7 @@ def _close_stale_routine_tasks(latest_build_id, seen_issue_keys):
     jql = (
         f"labels in ('{routine_label}') "
         f"AND labels not in ('test_fix', '{out_rc_label}') "
-        f"AND status not in ('Closed')"
+        f"AND statusCategory != Done"
     )
     open_jira_issues = get_all_issues(jql, fields=["key"])
     open_keys = {issue.key for issue in open_jira_issues}
@@ -1167,8 +1221,12 @@ def _find_similar_open_issues(case_id, result_error, *, return_list=False):
                 continue
 
             try:
-                _, status = get_issue_status_by_key(issue_key)
-                if status != "Closed":  # <-- keep
+                _, _, category = get_issue_status_by_key(issue_key)
+                # Compare on the status category (locale-independent) so that
+                # localized status names ("Chiusa", "Risolta", …) don't
+                # masquerade as still-open tickets. "done" covers Closed,
+                # Resolved, Done — any terminal state in the workflow.
+                if category != "done":
                     open_issues.append(issue_key)
             except Exception as e:
                 print(f"Error retrieving issue {issue_key}: {e}")
@@ -1223,7 +1281,7 @@ def _find_existing_open_ticket_for_error(epic, error_text):
 
     jql_parts = [
         f'labels = "{routine_label}"',
-        'status != "Closed"',
+        'statusCategory != Done',
     ]
     if epic is not None:
         jql_parts.append(f'parent = "{epic.key}"')
