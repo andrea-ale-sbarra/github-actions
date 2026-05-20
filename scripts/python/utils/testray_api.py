@@ -22,10 +22,10 @@ LIFERAY_PORTAL_PROJECT_ID = 35392
 STATUS_FAILED_BLOCKED_TESTFIX = "FAILED,TESTFIX,BLOCKED"
 
 
-def testray_build_url(build_id):
+def testray_build_url(build_id, routine_id=ACCEPTANCE_ROUTINE_ID):
     return (
         f"{TESTRAY_UI_URL}#/project/{LIFERAY_PORTAL_PROJECT_ID}"
-        f"/routines/{ACCEPTANCE_ROUTINE_ID}/build/{build_id}"
+        f"/routines/{routine_id}/build/{build_id}"
     )
 
 
@@ -286,14 +286,19 @@ def find_case_by_exact_name(name):
     return None
 
 
-def find_case_result_in_build_via_history(build_id, case_id):
+def find_case_result_in_build_via_history(build_id, case_id, routine_id=ACCEPTANCE_ROUTINE_ID):
     """Find the case result for `case_id` within `build_id`.
 
     Walks the testray-rest `case-result-history` endpoint for the case,
-    filtered server-side to the Acceptance routine and (when honored)
+    filtered server-side to the given routine and (when honored)
     to the specific build. The endpoint is already used elsewhere in
     this script for AFT history and is the reliable way to navigate
     from (case, build) to a specific case-result row.
+
+    `routine_id` defaults to Acceptance for callers that already only
+    care about Acceptance; the PR review check passes the routine the
+    build actually belongs to (e.g. Commerce 35394) so the server-side
+    filter doesn't silently drop the row.
 
     Returns a dict shaped as:
         {"id": <case_result_id>, "dueStatus": {"name": "<STATUS>"}}
@@ -306,7 +311,7 @@ def find_case_result_in_build_via_history(build_id, case_id):
     page_size = 500
     while True:
         params = (
-            f"testrayRoutineIds={ACCEPTANCE_ROUTINE_ID}"
+            f"testrayRoutineIds={routine_id}"
             f"&testrayBuildIds={expected_build}"
             f"&page={page}&pageSize={page_size}"
         )

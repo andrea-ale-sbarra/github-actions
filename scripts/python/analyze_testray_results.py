@@ -7,7 +7,7 @@ from utils.testray_helpers import (
     select_routines,
 )
 from utils.testray_api import get_routine_to_builds
-from utils.pr_check import check_pr_failures_for_routine
+from utils.pr_check import MODE_FULL, check_pr_failures_for_routine
 
 import os
 
@@ -28,7 +28,7 @@ if __name__ == "__main__":
         # errors out (the analysis has already finished by this point and we
         # don't want a GitHub/Jira hiccup to lose the recap).
         try:
-            pr_results = check_pr_failures_for_routine(routine)
+            pr_results = check_pr_failures_for_routine(routine, mode=MODE_FULL)
             pr_check_by_routine_id[routine["id"]] = pr_results
         except Exception as e:
             print(f"PR review check failed for {routine['name']}: {e}")

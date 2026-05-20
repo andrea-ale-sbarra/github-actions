@@ -9,12 +9,24 @@ For every Jira ticket carrying the routine's `check_label` (`commerce_check_fail
      post-merge HEAD SHA + the explicit list of commits in the range.
   2. Calls GitHub's `compare` endpoint to get the files that range
      touched.
-  3. Finds the earliest DONE Acceptance build whose `gitHash` has the
-     merge HEAD SHA as an ancestor — verified via GitHub's compare API
-     against `liferay/liferay-portal`. Acceptance samples master rather
-     than running on every commit, so an exact `gitHash == HEAD SHA`
-     match would miss most merges; the ancestry check picks the first
-     build whose snapshot actually included the merge.
+  3. Finds a DONE Testray build whose `gitHash` has the merge HEAD SHA
+     as an ancestor — verified via GitHub's compare API against
+     `liferay/liferay-portal`. Both Acceptance and the per-routine
+     pipelines (Commerce / UM) sample master at scheduled intervals, so
+     an exact `gitHash == HEAD SHA` match would miss most merges; the
+     ancestry check picks a build whose snapshot actually included the
+     merge.
+
+     Which routines we consult, in what order, and whether we pick the
+     earliest or latest matching build is decided by the caller's mode:
+       • `MODE_FULL` (called alongside the failure analysis): try the
+         ticket's own routine first, fall back to Acceptance. Picks the
+         earliest matching build — the first post-merge sample, useful
+         for "did my merge break anything?".
+       • `MODE_STANDALONE` (manual re-check after a fresh Acceptance
+         build): try Acceptance first, fall back to the ticket's
+         routine. Picks the latest matching build — the freshest
+         verdict.
   4. Matches the test files in the diff against the case names that ran
      in that build and reports each one's status (PASSED / FAILED /
      BLOCKED / NOT FOUND).
@@ -46,6 +58,26 @@ from testray_api import (
     LIFERAY_PORTAL_PROJECT_ID,
 )
 from github_api import get_compare, is_ancestor
+
+# Modes for `check_pr_failures_for_routine`. They differ along two axes:
+#
+#   * routine preference — which routine to consult first for the build
+#     that contains the merge SHA;
+#   * build ordering — among the candidate builds containing the merge,
+#     pick the earliest (first post-merge sample) or the latest (most
+#     recent verdict).
+#
+# Full-analysis mode runs once per day alongside the failure analysis: the
+# ticket's own routine (Commerce / UM) is the natural place to look, and
+# the *earliest* sample post-merge isolates the verdict from later
+# unrelated changes — useful for "did my merge break anything?".
+#
+# Standalone mode is typically launched manually after a fresh Acceptance
+# build completes, to re-check tickets the morning analysis already saw:
+# Acceptance is the authoritative gate, and the *latest* matching build
+# gives the freshest verdict.
+MODE_FULL = "full"
+MODE_STANDALONE = "standalone"
 
 # Acceptance runs on the upstream Liferay portal repo; ancestry checks
 # against the build's `gitHash` therefore go through this owner/repo.
@@ -122,8 +154,12 @@ _JS_TEST_BLOCK_RE = re.compile(
 # Public API
 # ---------------------------------------------------------------------------
 
-def check_pr_failures_for_routine(routine):
+def check_pr_failures_for_routine(routine, mode=MODE_FULL):
     """Run the PR review check for one routine.
+
+    `mode` controls which routine is consulted first and whether the
+    earliest or latest matching build is picked. See the `MODE_FULL` /
+    `MODE_STANDALONE` constants for the rationale.
 
     Returns a list of per-ticket result dicts (see `_check_ticket` for the
     shape) — possibly empty if the routine has no `check_label` configured
@@ -135,7 +171,7 @@ def check_pr_failures_for_routine(routine):
 
     print(
         f"\n=== PR review check: routine '{routine['name']}' "
-        f"(label={label}) ===\n"
+        f"(label={label}, mode={mode}) ===\n"
     )
 
     issues = _fetch_tagged_issues(label)
@@ -145,19 +181,49 @@ def check_pr_failures_for_routine(routine):
 
     print(f"  Found {len(issues)} ticket(s) to check.\n")
 
-    # Acceptance returns the same list of builds for every ticket; fetch
-    # it once and reuse it (the call paginates through hundreds of builds
-    # and takes a few seconds).
-    print("  Loading Acceptance build list (one-shot for all tickets)...", flush=True)
-    builds_cache = get_routine_to_builds(ACCEPTANCE_ROUTINE_ID) or []
-    print(f"  → {len(builds_cache)} Acceptance build(s) loaded.\n", flush=True)
+    # Both the ticket's own routine and Acceptance can contain the
+    # build we want; load both once and pass them down. The lookup
+    # order (and whether to pick earliest vs latest) depends on `mode`.
+    routine_lookup_order, prefer_latest = _resolve_routine_lookup(routine, mode)
+
+    builds_by_routine = {}
+    for rid, rname in routine_lookup_order:
+        print(
+            f"  Loading {rname} build list (routine {rid})...",
+            flush=True,
+        )
+        builds_by_routine[rid] = get_routine_to_builds(rid) or []
+        print(
+            f"  → {len(builds_by_routine[rid])} {rname} build(s) loaded.",
+            flush=True,
+        )
+    print()
 
     results = []
     for issue in issues:
-        result = _check_ticket(issue, builds_cache)
+        result = _check_ticket(
+            issue, builds_by_routine, routine_lookup_order, prefer_latest
+        )
         results.append(result)
         _log_ticket_result(result)
     return results
+
+
+def _resolve_routine_lookup(routine, mode):
+    """Return `(routine_lookup_order, prefer_latest)` for `mode`.
+
+    `routine_lookup_order` is a list of `(routine_id, routine_name)`
+    pairs in the order the PR check should consult them when searching
+    for a build containing the merge SHA.
+    """
+    ticket_routine = (routine["id"], routine["name"])
+    acceptance_routine = (ACCEPTANCE_ROUTINE_ID, "Acceptance")
+
+    if mode == MODE_FULL:
+        return [ticket_routine, acceptance_routine], False
+    if mode == MODE_STANDALONE:
+        return [acceptance_routine, ticket_routine], True
+    raise ValueError(f"Unknown PR check mode: {mode!r}")
 
 
 def format_pr_check_block(routine, results):
@@ -194,13 +260,14 @@ def format_pr_check_block(routine, results):
         compare_url = r.get("compare_url") or ""
         build_url = r.get("build_url") or ""
         build_id = r.get("build_id")
+        routine_name = r.get("routine_name") or "Acceptance"
 
         meta_parts = []
         if compare_url:
             meta_parts.append(f"merge diff: {compare_url}")
         meta_parts.append(f"SHA {sha_short}")
         if build_url:
-            meta_parts.append(f"Acceptance build {build_id}: {build_url}")
+            meta_parts.append(f"{routine_name} build {build_id}: {build_url}")
         lines.append(ticket_line + " - " + " | ".join(meta_parts))
 
         for tr in r["test_results"]:
@@ -261,7 +328,7 @@ def print_pr_check_standalone(pr_check_by_routine):
 _SKIP_REASON_LABELS = {
     "no_merge_diff": "no 'View total diff' link found on the ticket",
     "no_test_files": "merge diff contains no test files",
-    "build_not_found": "no DONE Acceptance build after the merge yet",
+    "build_not_found": "no DONE build (routine or Acceptance) after the merge yet",
     "github_error": "GitHub API error",
 }
 
@@ -275,7 +342,7 @@ def _fetch_tagged_issues(label):
     return get_all_issues(jql, fields="summary,comment,labels,status")
 
 
-def _check_ticket(issue, builds_cache):
+def _check_ticket(issue, builds_by_routine, routine_lookup_order, prefer_latest):
     """Compute the PR-check verdict for a single Jira issue.
 
     Returned shape:
@@ -289,6 +356,8 @@ def _check_ticket(issue, builds_cache):
             "commit_sha": str | None,  # HEAD of the merge diff
             "build_id": int | None,
             "build_url": str | None,
+            "routine_id": int | None,    # routine the matched build lives in
+            "routine_name": str | None,
             "test_results": [
                 {"case_name": str, "status": str, "caseresult_url": str | None}
             ],
@@ -306,6 +375,8 @@ def _check_ticket(issue, builds_cache):
         "commit_sha": None,
         "build_id": None,
         "build_url": None,
+        "routine_id": None,
+        "routine_name": None,
         "test_results": [],
     }
 
@@ -352,38 +423,53 @@ def _check_ticket(issue, builds_cache):
         base["skip_reason"] = "no_test_files"
         return base
 
-    # Acceptance doesn't run on every commit — it samples master at
-    # scheduled intervals. The relevant build for this merge is the
-    # earliest DONE build whose snapshot includes the merge commit, which
-    # we verify by asking GitHub whether `head_sha` is reachable from the
-    # build's `gitHash`.
+    # Neither Acceptance nor Commerce/UM runs on every commit — they
+    # sample master at scheduled intervals. The relevant build for this
+    # merge is a DONE build whose snapshot includes the merge commit,
+    # which we verify by asking GitHub whether `head_sha` is reachable
+    # from the build's `gitHash`. We try the routines in the order set
+    # by the calling mode and pick earliest or latest accordingly.
     commit_date = cmp_info.get("head_commit_date")
+    selection = "latest" if prefer_latest else "earliest"
+    routines_blurb = " then ".join(name for _, name in routine_lookup_order)
     print(
-        f"    · finding earliest DONE Acceptance build containing "
-        f"{head_sha[:7]} (post-{commit_date})...",
+        f"    · finding {selection} DONE build containing "
+        f"{head_sha[:7]} (post-{commit_date}); order: {routines_blurb}...",
         flush=True,
     )
-    build_id = _find_first_acceptance_build_containing(
-        head_sha, commit_date, builds_cache
+    match = _find_build_containing(
+        head_sha,
+        commit_date,
+        builds_by_routine,
+        routine_lookup_order,
+        prefer_latest,
     )
-    if not build_id:
+    if not match:
         print(
-            "    · no Acceptance build whose gitHash contains the merge yet "
-            "— skip",
+            "    · no build whose gitHash contains the merge yet (in any "
+            "of the consulted routines) — skip",
             flush=True,
         )
         base["skip_reason"] = "build_not_found"
         return base
 
+    build_id, routine_id, routine_name = match
     base["build_id"] = build_id
-    base["build_url"] = testray_build_url(build_id)
-    print(f"    · matched Acceptance build {build_id} → {base['build_url']}", flush=True)
+    base["routine_id"] = routine_id
+    base["routine_name"] = routine_name
+    base["build_url"] = testray_build_url(build_id, routine_id=routine_id)
+    print(
+        f"    · matched {routine_name} build {build_id} → {base['build_url']}",
+        flush=True,
+    )
 
     print(
         f"    · looking up test cases in build {build_id} (targeted query)...",
         flush=True,
     )
-    base["test_results"] = _collect_test_results(build_id, test_search_names)
+    base["test_results"] = _collect_test_results(
+        build_id, test_search_names, routine_id
+    )
     base["status"] = "checked"
     base["skip_reason"] = None
     return base
@@ -553,19 +639,25 @@ def _extract_js_test_descriptions(patch_text):
     return descriptions
 
 
-def _find_first_acceptance_build_containing(head_sha, commit_date, builds):
-    """Return the id of the earliest DONE Acceptance build whose `gitHash`
-    has `head_sha` as an ancestor — i.e. the first build whose master
-    snapshot actually contains the merge.
+def _find_build_containing(
+    head_sha, commit_date, builds_by_routine, routine_lookup_order, prefer_latest
+):
+    """Return `(build_id, routine_id, routine_name)` for the first
+    DONE build whose `gitHash` has `head_sha` as an ancestor — i.e. a
+    build whose master snapshot actually contains the merge — searched
+    in the routine order set by the caller.
 
-    Two-step selection to keep the GitHub call count bounded:
+    For each routine in `routine_lookup_order`:
 
-      1. Pre-filter the build list to DONE entries with `dueDate >=
-         commit_date` and a non-empty `gitHash`. Anything earlier can't
-         possibly contain the merge, and there's no point asking GitHub.
-      2. Sort ascending by `dueDate` and, for each candidate, ask
-         GitHub's compare endpoint whether `head_sha` is reachable from
-         `gitHash`. Return the first build for which it is.
+      1. Pre-filter that routine's build list to DONE entries with
+         `dueDate >= commit_date` and a non-empty `gitHash`. Anything
+         earlier can't possibly contain the merge.
+      2. Sort by `dueDate` ascending (then `prefer_latest=False` picks
+         the earliest match) or descending (`prefer_latest=True` picks
+         the latest), and for each candidate ask GitHub's compare
+         endpoint whether `head_sha` is reachable from `gitHash`.
+      3. The first build for which it is wins. Move on to the next
+         routine only when this routine has no match.
 
     Why ancestry instead of `dueDate >= commit_date` alone: `dueDate` is
     the *scheduled* run time, not the moment master was pulled. If the
@@ -574,49 +666,71 @@ def _find_first_acceptance_build_containing(head_sha, commit_date, builds):
     report would then show PASSED for tests that haven't actually run on
     the fix yet.
 
-    `builds` is the cached list of Acceptance builds passed by the caller
-    so we don't paginate through hundreds of builds once per ticket.
+    `builds_by_routine` is keyed by routine id and holds the cached lists
+    passed by the caller so we don't paginate through hundreds of builds
+    once per ticket.
     """
     if not commit_date:
         return None
 
-    candidates = [
-        b for b in builds
-        if (b.get("dueDate") or "") >= commit_date
-        and (b.get("importStatus") or {}).get("key") == "DONE"
-        and b.get("gitHash")
-    ]
-    if not candidates:
-        return None
-    candidates.sort(key=lambda b: b.get("dueDate") or "")
-
-    for b in candidates:
-        git_hash = b["gitHash"]
-        build_id = b.get("id")
-        try:
-            contains = is_ancestor(
-                _UPSTREAM_OWNER, _UPSTREAM_REPO, head_sha, git_hash
-            )
-        except Exception as e:
+    for routine_id, routine_name in routine_lookup_order:
+        builds = builds_by_routine.get(routine_id) or []
+        candidates = [
+            b for b in builds
+            if (b.get("dueDate") or "") >= commit_date
+            and (b.get("importStatus") or {}).get("key") == "DONE"
+            and b.get("gitHash")
+        ]
+        if not candidates:
             print(
-                f"    · ancestry check failed for build {build_id} "
-                f"(gitHash {git_hash[:7]}): {e}; trying next",
+                f"    · no DONE {routine_name} build dated after "
+                f"{commit_date}; trying next routine",
                 flush=True,
             )
             continue
-        if contains:
-            return build_id
+
+        candidates.sort(
+            key=lambda b: b.get("dueDate") or "", reverse=prefer_latest
+        )
+
+        matched = None
+        for b in candidates:
+            git_hash = b["gitHash"]
+            build_id = b.get("id")
+            try:
+                contains = is_ancestor(
+                    _UPSTREAM_OWNER, _UPSTREAM_REPO, head_sha, git_hash
+                )
+            except Exception as e:
+                print(
+                    f"    · ancestry check failed for {routine_name} build "
+                    f"{build_id} (gitHash {git_hash[:7]}): {e}; trying next",
+                    flush=True,
+                )
+                continue
+            if contains:
+                matched = build_id
+                break
+            print(
+                f"    · {routine_name} build {build_id} "
+                f"(gitHash {git_hash[:7]}, dueDate {b.get('dueDate')}) "
+                f"does not yet contain {head_sha[:7]}; trying next",
+                flush=True,
+            )
+
+        if matched is not None:
+            return matched, routine_id, routine_name
+
         print(
-            f"    · build {build_id} (gitHash {git_hash[:7]}, "
-            f"dueDate {b.get('dueDate')}) does not yet contain "
-            f"{head_sha[:7]}; trying next",
+            f"    · no {routine_name} build whose gitHash contains the "
+            f"merge yet; trying next routine",
             flush=True,
         )
 
     return None
 
 
-def _collect_test_results(build_id, test_search_names):
+def _collect_test_results(build_id, test_search_names, routine_id):
     """Resolve each `(name, is_exact)` pair to a Testray case-result.
 
     Two lookups per name:
@@ -669,7 +783,9 @@ def _collect_test_results(build_id, test_search_names):
                 matched_inputs.add((name, is_exact))
                 continue
 
-            cr = find_case_result_in_build_via_history(build_id, case_id)
+            cr = find_case_result_in_build_via_history(
+                build_id, case_id, routine_id=routine_id
+            )
             if not cr:
                 # Case exists but didn't run in this build. Still count
                 # the input as matched — we don't also want a NOT FOUND
@@ -684,7 +800,7 @@ def _collect_test_results(build_id, test_search_names):
                 caseresult_url = testray_case_result_url(
                     case_result_id,
                     project_id=LIFERAY_PORTAL_PROJECT_ID,
-                    routine_id=ACCEPTANCE_ROUTINE_ID,
+                    routine_id=routine_id,
                     build_id=build_id,
                 )
             out_by_name[case_name] = {
@@ -719,7 +835,8 @@ def _log_ticket_result(r):
     for tr in r["test_results"]:
         counts[tr["status"]] = counts.get(tr["status"], 0) + 1
     pretty = ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "no matching cases"
+    routine_name = r.get("routine_name") or "Acceptance"
     print(
-        f"  - {key}: build {r['build_id']} (SHA {(r['commit_sha'] or '')[:12]}) "
-        f"→ {pretty}"
+        f"  - {key}: {routine_name} build {r['build_id']} "
+        f"(SHA {(r['commit_sha'] or '')[:12]}) → {pretty}"
     )

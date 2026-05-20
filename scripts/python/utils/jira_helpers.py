@@ -22,16 +22,21 @@ def close_issue(issue_key, build_hash):
     """
     Final optimized flow:
     1. Load issue
-    2. Validate subtasks, collect the ones that are Open
-       - If any subtask not Open/Closed → ABORT
-    3. Close all Open subtasks immediately
+    2. Inspect subtasks via status category (locale-independent):
+       - 'done'          → already closed, skip
+       - 'new'           → safe to close (Open / To Do / Backlog / Selected for Development / …)
+       - 'indeterminate' → ABORT parent: a sub-task is actively being worked on
+       - anything else   → ABORT parent: unknown state, play it safe
+    3. Close every 'new'-category subtask, recording its original status
+       in the closing comment. If any close fails, ABORT the parent so
+       parent and sub-task never diverge.
     4. Move parent to 'Selected for Development'
     5. Close parent with resolution 'Discarded'
 
     Returns True if the parent issue was actually closed (or would be in
-    DRY_RUN mode), False otherwise (blocked subtask, missing transition,
-    exception). The boolean lets callers report which tickets were closed
-    by the current run.
+    DRY_RUN mode), False otherwise (active/unknown subtask, failed
+    sub-task close, missing transition, exception). The boolean lets
+    callers report which tickets were closed by the current run.
     """
 
     try:
@@ -50,35 +55,52 @@ def close_issue(issue_key, build_hash):
         print(f"\nℹ Processing {issue_key} (current status: {current_status})")
 
         # -----------------------------------------
-        # STEP 1: Validate subtasks + collect open ones
+        # STEP 1: Inspect subtasks by status category
         # -----------------------------------------
         subtasks = getattr(parent_issue.fields, "subtasks", [])
-        open_subtasks = []
+        subtasks_to_close = []  # list of (key, original_status_name)
         blocked = False
 
         for subtask in subtasks:
             subtask_key = subtask.key
             sub = jira.issue(subtask_key)
             status_name = sub.fields.status.name
+            category_key = getattr(
+                getattr(sub.fields.status, "statusCategory", None), "key", None
+            )
 
-            if status_name not in ["Open", "Closed"]:
-                print(f"⛔ Sub-task {subtask_key} is '{status_name}'. Aborting.")
+            if category_key == "done":
+                print(f"✔ Sub-task {subtask_key} is '{status_name}' (already done). Skipping.")
+            elif category_key == "new":
+                print(f"→ Sub-task {subtask_key} is '{status_name}' (not started). Will close.")
+                subtasks_to_close.append((subtask_key, status_name))
+            elif category_key == "indeterminate":
+                print(f"⛔ Sub-task {subtask_key} is '{status_name}' (active). Aborting.")
                 blocked = True
-            elif status_name == "Open":
-                open_subtasks.append(subtask_key)
+            else:
+                print(
+                    f"⛔ Sub-task {subtask_key} is '{status_name}' "
+                    f"(unknown status category '{category_key}'). Aborting."
+                )
+                blocked = True
 
         if blocked:
-            print(f"⛔ {issue_key} will NOT be touched due to active subtasks.")
+            print(f"⛔ {issue_key} will NOT be touched due to active/unknown subtasks.")
             return False
 
-        print(f"✔ Subtasks valid ({len(open_subtasks)} to close). Proceeding.")
+        print(f"✔ Subtasks valid ({len(subtasks_to_close)} to close). Proceeding.")
 
         # -----------------------------------------
-        # STEP 2 (moved): Close all Open subtasks NOW
+        # STEP 2: Close every safe subtask
         # -----------------------------------------
-        for subtask_key in open_subtasks:
-            print(f"→ Closing child {subtask_key}")
-            _transition_to_closed(subtask_key, build_hash)
+        for subtask_key, original_status in subtasks_to_close:
+            print(f"→ Closing child {subtask_key} (was '{original_status}')")
+            if not _transition_to_closed(subtask_key, build_hash, original_status):
+                print(
+                    f"⛔ Could not close sub-task {subtask_key}. "
+                    f"Aborting parent {issue_key} to keep parent/sub-task consistent."
+                )
+                return False
 
         # -----------------------------------------
         # STEP 3: Move parent to "Selected for Development"
@@ -295,17 +317,36 @@ def get_issue_status_by_key(issue_key):
         return None, None, None
 
 
-def _transition_to_closed(issue_key, build_hash):
+def _transition_to_closed(issue_key, build_hash, original_status=None):
     """
     Closes a single sub-task (directly to 'Closed' with 'Discarded').
+
+    Looks for a transition literally named 'Closed' first; falls back to
+    any transition that lands in the 'done' status category, so the
+    routine still works when the sub-task starts from a state like
+    'To Do' or 'Selected for Development' where the workflow names the
+    close transition differently.
+
+    Returns True on success, False otherwise. The caller uses this to
+    decide whether to proceed with the parent close.
     """
     try:
         if os.getenv("DRY_RUN", "false").lower() == "true":
             print(f"[DRY RUN] Would transition sub-task {issue_key} to 'Closed' → {jira_issue_url(issue_key)}")
-            return
+            return True
 
         transitions = _jira().transitions(issue_key)
-        close_transition = next((t for t in transitions if t["name"] == "Closed"), None)
+        close_transition = next(
+            (t for t in transitions if t.get("name") == "Closed"),
+            None,
+        ) or next(
+            (
+                t
+                for t in transitions
+                if t.get("to", {}).get("statusCategory", {}).get("key") == "done"
+            ),
+            None,
+        )
 
         if close_transition:
             _jira().transition_issue(
@@ -313,16 +354,20 @@ def _transition_to_closed(issue_key, build_hash):
                 transition=close_transition["id"],
                 resolution={"name": "Discarded"},
             )
+            origin_clause = f" (was '{original_status}')" if original_status else ""
             _jira().add_comment(
                 issue_key,
-                f"Closing sub-task. Not reproducible in current SHA {build_hash}",
+                f"Closing sub-task{origin_clause}. Not reproducible in current SHA {build_hash}",
             )
-            print(f"✔ {issue_key} → 'Closed' with 'Discarded'")
+            print(f"✔ {issue_key} → '{close_transition['name']}' with 'Discarded'")
+            return True
         else:
-            print(f"✘ Could not find 'Closed' transition for sub-task {issue_key}")
+            print(f"✘ No transition to a 'done' status found for sub-task {issue_key}")
+            return False
 
     except Exception as e:
         print(f"✘ Failed to close sub-task {issue_key}: {e}")
+        return False
 
 
 @lru_cache()
