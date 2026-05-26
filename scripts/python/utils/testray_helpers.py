@@ -17,6 +17,7 @@ from jira_helpers import (
     create_jira_task,
     get_all_issues,
     close_issue,
+    close_orphan_subtasks_of_discarded,
     is_valid_jira_key,
     jira_issue_url,
 )
@@ -122,12 +123,15 @@ def analyze_testflow(builds, routine_id):
       3) process subtasks & results (collect updates only)
       4) apply updates and attempt task completion/cleanup
 
-    Returns (task_id, closure_summary) where:
+    Returns (task_id, closure_summary, cleanup_summary) where:
       - task_id is None if no analysis happened
-      - closure_summary is None if no stale closure was attempted, otherwise
-        a dict {build_id, build_hash, attempted, closed} from
-        _close_stale_routine_tasks. The caller uses it to print the per-run
-        closure report.
+      - closure_summary is None if no stale closure was attempted,
+        otherwise a dict {build_id, build_hash, attempted, closed} from
+        _close_stale_routine_tasks. The caller uses it to print the
+        per-run closure report.
+      - cleanup_summary is None if no retroactive pass ran, otherwise
+        the dict returned by _cleanup_discarded_parents_subtasks
+        (orphan sub-tasks closed under already-Discarded parents).
     """
     global _CURRENT_ROUTINE_ID
     previous_routine_id = _CURRENT_ROUTINE_ID
@@ -135,7 +139,7 @@ def analyze_testflow(builds, routine_id):
     try:
         latest_build = _pick_build_to_analyze(builds)
         if not latest_build:
-            return None, None
+            return None, None, None
 
         task_id, latest_build_id = _prepare_task(latest_build)
 
@@ -144,7 +148,7 @@ def analyze_testflow(builds, routine_id):
 
         if not task_id:
             print("✘ Could not find or create a valid task, exiting.")
-            return None, None
+            return None, None, None
 
         sha = get_build_sha(latest_build_id)
         acceptance_build_id = get_acceptance_build_id_for_current_sha(sha)
@@ -159,12 +163,12 @@ def analyze_testflow(builds, routine_id):
             acceptance_build_id=acceptance_build_id,
         )
 
-        closure_summary = _finalize_task_completion(
+        closure_summary, cleanup_summary = _finalize_task_completion(
             task_id=task_id,
             latest_build_id=latest_build_id,
         )
 
-        return task_id, closure_summary
+        return task_id, closure_summary, cleanup_summary
     finally:
         _CURRENT_ROUTINE_ID = previous_routine_id
 
@@ -173,7 +177,7 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
     """
     Print one plain-text recap covering every routine analyzed in this run.
 
-    The output is structured as four sections, in order:
+    The output is structured as five sections, in order:
 
       1. Open Jira tickets per routine (with the Testray analysis task
          link and the per-component JQL URLs).
@@ -181,16 +185,21 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
       3. Closure report — tickets auto-closed as not reproducible during
          this run (only present when the run is invoked with closure
          summaries, i.e. through `analyze_testray_results.py`).
+      3b. Discarded-parent cleanup report — orphan sub-tasks closed
+          under parents already in Closed/Discarded (only present when
+          the caller passes cleanup summaries).
       4. Test analysis — PR review check, listing the tests Testray ran
          for each merged ticket carrying the routine's `check_label`.
 
-    `routine_runs` is an iterable of (routine_config, task_id) or
-    (routine_config, task_id, closure_summary) tuples, where
-    routine_config is an entry from ANALYZED_ROUTINES. closure_summary
-    may be None (no closure attempt) or a dict
+    `routine_runs` is an iterable of (routine_config, task_id),
+    (routine_config, task_id, closure_summary), or
+    (routine_config, task_id, closure_summary, cleanup_summary) tuples,
+    where routine_config is an entry from ANALYZED_ROUTINES.
+    closure_summary may be None (no closure attempt) or a dict
     {build_id, build_hash, attempted, closed} from
-    _close_stale_routine_tasks. Routines whose task_id is None (no DONE
-    build, dry-run, etc.) are skipped.
+    _close_stale_routine_tasks. cleanup_summary may be None or a dict
+    from _cleanup_discarded_parents_subtasks. Routines whose task_id
+    is None (no DONE build, dry-run, etc.) are skipped.
 
     `pr_check_by_routine_id` (optional) maps routine id → list of PR
     check result dicts (see `utils.pr_check.check_pr_failures_for_routine`).
@@ -230,6 +239,7 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
     ]
 
     section3 = _format_closure_report_lines(routine_runs)
+    section3b = _format_cleanup_report_lines(routine_runs)
 
     section4 = []
     pr_blocks = []
@@ -251,6 +261,7 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
         *section1,
         *section2,
         *section3,
+        *section3b,
         *section4,
     ]
 
@@ -386,6 +397,97 @@ def _format_closure_report_lines(routine_runs, recent_build_window=20):
             )
             for key in skipped:
                 lines.append(f"    - {key}  {jira_issue_url(key)}")
+
+        lines.append("")
+
+    return lines
+
+
+def _format_cleanup_report_lines(routine_runs):
+    """Return the plain-text cleanup-report lines for the retroactive
+    pass over already-Discarded parents (empty if nothing to report).
+
+    Surfaces three buckets per routine, all driven by the
+    `cleanup_summary` produced by `_cleanup_discarded_parents_subtasks`:
+      - sub-tasks closed (parent/sub-task consistency restored)
+      - sub-tasks skipped because they are still active (need a human)
+      - sub-tasks skipped because of an unknown status category
+
+    Accepts 4-tuples `(routine, task_id, closure_summary, cleanup_summary)`
+    and ignores shorter tuples coming from callers that haven't been
+    updated yet.
+    """
+    actionable = []
+    for entry in routine_runs:
+        if len(entry) < 4:
+            continue
+        routine, summary = entry[0], entry[3]
+        if not summary:
+            continue
+        if (
+            summary.get("subtasks_closed")
+            or summary.get("subtasks_skipped_active")
+            or summary.get("subtasks_skipped_unknown")
+            or summary.get("subtasks_failed")
+        ):
+            actionable.append((routine, summary))
+
+    if not actionable:
+        return []
+
+    lines = [
+        "Discarded-parent cleanup - orphan sub-tasks under already-Discarded parents:",
+        "",
+    ]
+
+    for routine, summary in actionable:
+        lines.append(
+            f"{routine['name']}  ({summary.get('parents_scanned', 0)} "
+            "Discarded parent(s) scanned)"
+        )
+
+        closed = summary.get("subtasks_closed", [])
+        if closed:
+            lines.append(f"  Closed ({len(closed)}):")
+            for parent_key, sub_key in closed:
+                lines.append(
+                    f"    - {sub_key}  {jira_issue_url(sub_key)}  "
+                    f"(parent {parent_key})"
+                )
+
+        active = summary.get("subtasks_skipped_active", [])
+        if active:
+            lines.append(
+                f"  Skipped - active sub-tasks under Discarded parent "
+                f"({len(active)}) - close manually:"
+            )
+            for parent_key, sub_key in active:
+                lines.append(
+                    f"    - {sub_key}  {jira_issue_url(sub_key)}  "
+                    f"(parent {parent_key})"
+                )
+
+        unknown = summary.get("subtasks_skipped_unknown", [])
+        if unknown:
+            lines.append(
+                f"  Skipped - unknown status category ({len(unknown)}):"
+            )
+            for parent_key, sub_key in unknown:
+                lines.append(
+                    f"    - {sub_key}  {jira_issue_url(sub_key)}  "
+                    f"(parent {parent_key})"
+                )
+
+        failed = summary.get("subtasks_failed", [])
+        if failed:
+            lines.append(
+                f"  Failed to close ({len(failed)}) - see logs above:"
+            )
+            for parent_key, sub_key in failed:
+                lines.append(
+                    f"    - {sub_key}  {jira_issue_url(sub_key)}  "
+                    f"(parent {parent_key})"
+                )
 
         lines.append("")
 
@@ -735,22 +837,26 @@ def _finalize_task_completion(*, task_id, latest_build_id):
     If all subtasks are COMPLETE, close stale routine tickets and complete the task.
     Individual subtask completion already happened in _process_task_subtasks.
 
-    Returns the closure summary from _close_stale_routine_tasks (or None if
-    the task is not yet complete and no closure was attempted), so the
-    end-of-run report can show what was closed.
+    Returns (closure_summary, cleanup_summary):
+      - closure_summary from _close_stale_routine_tasks (tickets the
+        current run closed as 'not reproducible')
+      - cleanup_summary from _cleanup_discarded_parents_subtasks
+        (orphan sub-tasks closed under parents already Discarded)
+    Both are None if the task is not yet complete (nothing attempted).
     """
     subtasks = get_task_subtasks(task_id)
     if not all(s.get("dueStatus", {}).get("key") == "COMPLETE" for s in subtasks):
         print(f"✔ Task {task_id} is not completed. Further processing required.")
-        return None
+        return None, None
 
     seen_issue_keys = _collect_issue_keys_from_subtasks(subtasks)
     closure_summary = _close_stale_routine_tasks(latest_build_id, seen_issue_keys)
+    cleanup_summary = _cleanup_discarded_parents_subtasks()
 
     print(f"✔ All subtasks are complete, completing task {task_id}")
     complete_task(task_id)
     print(f"✔ Task {task_id} is now complete. No further processing required.")
-    return closure_summary
+    return closure_summary, cleanup_summary
 
 
 def _is_subtask_complete(subtask):
@@ -993,6 +1099,81 @@ def _close_stale_routine_tasks(latest_build_id, seen_issue_keys):
         for issue_key in to_close:
             if close_issue(issue_key, build_hash):
                 summary["closed"].append(issue_key)
+    return summary
+
+
+def _cleanup_discarded_parents_subtasks():
+    """
+    Retroactive consistency pass: walk every routine ticket already
+    Closed/Discarded and close any sub-task left open underneath it.
+
+    Scoped to the current routine's label so running one routine in
+    isolation never touches another routine's tickets. Subtask handling
+    is delegated to `close_orphan_subtasks_of_discarded` — active
+    sub-tasks are skipped with a warning rather than force-closed.
+
+    Returns a summary dict the caller can surface in the run report:
+        {
+            "parents_scanned":         int,
+            "parents_with_changes":    [parent_key, ...],
+            "subtasks_closed":         [(parent_key, subtask_key), ...],
+            "subtasks_skipped_active": [(parent_key, subtask_key), ...],
+            "subtasks_skipped_unknown":[(parent_key, subtask_key), ...],
+            "subtasks_failed":         [(parent_key, subtask_key), ...],
+        }
+    """
+    summary = {
+        "parents_scanned": 0,
+        "parents_with_changes": [],
+        "subtasks_closed": [],
+        "subtasks_skipped_active": [],
+        "subtasks_skipped_unknown": [],
+        "subtasks_failed": [],
+    }
+
+    routine = _get_routine_config(_CURRENT_ROUTINE_ID)
+    if not routine:
+        print(
+            f"⚠ No routine config for id {_CURRENT_ROUTINE_ID}; "
+            "skipping discarded-parent cleanup pass."
+        )
+        return summary
+
+    routine_label = routine["routine_label"]
+    jql = (
+        f"labels in ('{routine_label}') "
+        f"AND statusCategory = Done "
+        f"AND resolution = Discarded"
+    )
+    parents = get_all_issues(jql, fields=["key"])
+    summary["parents_scanned"] = len(parents)
+    if not parents:
+        return summary
+
+    print(
+        f"ℹ Cleanup pass: scanning {len(parents)} Discarded parent(s) "
+        f"with label '{routine_label}' for orphan sub-tasks."
+    )
+
+    for parent in parents:
+        parent_summary = close_orphan_subtasks_of_discarded(parent.key)
+        touched = (
+            parent_summary["closed"]
+            or parent_summary["skipped_active"]
+            or parent_summary["skipped_unknown"]
+            or parent_summary["failed"]
+        )
+        if touched:
+            summary["parents_with_changes"].append(parent.key)
+        for key in parent_summary["closed"]:
+            summary["subtasks_closed"].append((parent.key, key))
+        for key in parent_summary["skipped_active"]:
+            summary["subtasks_skipped_active"].append((parent.key, key))
+        for key in parent_summary["skipped_unknown"]:
+            summary["subtasks_skipped_unknown"].append((parent.key, key))
+        for key in parent_summary["failed"]:
+            summary["subtasks_failed"].append((parent.key, key))
+
     return summary
 
 

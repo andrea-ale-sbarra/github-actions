@@ -317,7 +317,116 @@ def get_issue_status_by_key(issue_key):
         return None, None, None
 
 
-def _transition_to_closed(issue_key, build_hash, original_status=None):
+def close_orphan_subtasks_of_discarded(parent_key):
+    """
+    For a parent that is already Closed/Discarded, close any sub-task
+    still left open. This is the retroactive cleanup counterpart to
+    `close_issue`: when a parent was discarded in the past, its
+    sub-tasks must also be closed for parent/sub-task consistency.
+
+    Sub-task handling mirrors `close_issue`:
+      - statusCategory == 'done'          → skip silently
+      - statusCategory == 'new'           → close with 'Discarded'
+      - statusCategory == 'indeterminate' → skip with warning (active work)
+      - anything else                     → skip with warning (unknown state)
+
+    The closing comment is a fixed pointer to the parent — no SHA, since
+    no test run is driving this closure.
+
+    Returns a dict:
+        {
+            "parent":                 parent_key,
+            "closed":                 [subtask_key, ...],
+            "skipped_active":         [subtask_key, ...],
+            "skipped_unknown":        [subtask_key, ...],
+            "failed":                 [subtask_key, ...],
+        }
+    """
+    summary = {
+        "parent": parent_key,
+        "closed": [],
+        "skipped_active": [],
+        "skipped_unknown": [],
+        "failed": [],
+    }
+
+    try:
+        jira = _jira()
+        parent_issue = jira.issue(parent_key)
+        subtasks = getattr(parent_issue.fields, "subtasks", [])
+
+        if not subtasks:
+            return summary
+
+        dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
+        comment = (
+            f"Closing sub-task: parent {parent_key} was already "
+            "closed as Discarded"
+        )
+
+        for subtask in subtasks:
+            subtask_key = subtask.key
+            try:
+                sub = jira.issue(subtask_key)
+            except Exception as e:
+                print(f"✘ Could not load sub-task {subtask_key}: {e}")
+                summary["failed"].append(subtask_key)
+                continue
+
+            status_name = sub.fields.status.name
+            category_key = getattr(
+                getattr(sub.fields.status, "statusCategory", None), "key", None
+            )
+
+            if category_key == "done":
+                continue
+            if category_key == "new":
+                if dry_run:
+                    print(
+                        f"[DRY RUN] Would close sub-task {subtask_key} "
+                        f"(was '{status_name}') for parent {parent_key} → "
+                        f"{jira_issue_url(subtask_key)}"
+                    )
+                    summary["closed"].append(subtask_key)
+                    continue
+
+                print(
+                    f"→ Closing orphan sub-task {subtask_key} "
+                    f"(was '{status_name}') — parent {parent_key} is Discarded"
+                )
+                if _transition_to_closed(
+                    subtask_key,
+                    build_hash=None,
+                    original_status=status_name,
+                    comment_override=comment,
+                ):
+                    summary["closed"].append(subtask_key)
+                else:
+                    summary["failed"].append(subtask_key)
+            elif category_key == "indeterminate":
+                print(
+                    f"⚠ Sub-task {subtask_key} is '{status_name}' (active) "
+                    f"under Discarded parent {parent_key}. Skipping — close manually."
+                )
+                summary["skipped_active"].append(subtask_key)
+            else:
+                print(
+                    f"⚠ Sub-task {subtask_key} is '{status_name}' "
+                    f"(unknown category '{category_key}') under Discarded "
+                    f"parent {parent_key}. Skipping."
+                )
+                summary["skipped_unknown"].append(subtask_key)
+
+        return summary
+
+    except Exception as e:
+        print(f"✘ Failed to inspect parent {parent_key}: {e}")
+        return summary
+
+
+def _transition_to_closed(
+    issue_key, build_hash, original_status=None, comment_override=None
+):
     """
     Closes a single sub-task (directly to 'Closed' with 'Discarded').
 
@@ -326,6 +435,12 @@ def _transition_to_closed(issue_key, build_hash, original_status=None):
     routine still works when the sub-task starts from a state like
     'To Do' or 'Selected for Development' where the workflow names the
     close transition differently.
+
+    When `comment_override` is provided, it replaces the default
+    "Not reproducible in SHA …" comment. Used by the retroactive cleanup
+    pass that closes subtasks of parents already Discarded — there is no
+    test run behind that closure, so the SHA reference would be
+    misleading.
 
     Returns True on success, False otherwise. The caller uses this to
     decide whether to proceed with the parent close.
@@ -354,11 +469,15 @@ def _transition_to_closed(issue_key, build_hash, original_status=None):
                 transition=close_transition["id"],
                 resolution={"name": "Discarded"},
             )
-            origin_clause = f" (was '{original_status}')" if original_status else ""
-            _jira().add_comment(
-                issue_key,
-                f"Closing sub-task{origin_clause}. Not reproducible in current SHA {build_hash}",
-            )
+            if comment_override:
+                comment = comment_override
+            else:
+                origin_clause = f" (was '{original_status}')" if original_status else ""
+                comment = (
+                    f"Closing sub-task{origin_clause}. "
+                    f"Not reproducible in current SHA {build_hash}"
+                )
+            _jira().add_comment(issue_key, comment)
             print(f"✔ {issue_key} → '{close_transition['name']}' with 'Discarded'")
             return True
         else:

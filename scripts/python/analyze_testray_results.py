@@ -20,9 +20,11 @@ if __name__ == "__main__":
     for routine in select_routines():
         print(f"\n=== Analyzing routine: {routine['name']} (id={routine['id']}) ===\n")
         builds = get_routine_to_builds(routine["id"])
-        task_id, closure_summary = analyze_testflow(builds, routine["id"])
+        task_id, closure_summary, cleanup_summary = analyze_testflow(
+            builds, routine["id"]
+        )
         report_aft_ratio_for_latest(builds)
-        routine_runs.append((routine, task_id, closure_summary))
+        routine_runs.append((routine, task_id, closure_summary, cleanup_summary))
 
         # PR review check: read-only, never blocks the main analysis if it
         # errors out (the analysis has already finished by this point and we
