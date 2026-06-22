@@ -42,6 +42,7 @@ from testray_api import (
     autofill_build,
     get_task_subtasks,
     get_subtask_case_results,
+    testray_subtask_url,
     assign_issue_to_case_result_batch,
     update_subtask_status,
     complete_task,
@@ -251,6 +252,7 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
     section3 = _format_closure_report_lines(routine_runs)
     section3b = _format_cleanup_report_lines(routine_runs)
     section3c = _format_sfd_skipped_report_lines(routine_runs)
+    section3d = _format_blocking_subtasks_report_lines(routine_runs)
 
     section4 = []
     pr_blocks = []
@@ -274,6 +276,7 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
         *section3,
         *section3b,
         *section3c,
+        *section3d,
         *section4,
     ]
 
@@ -457,6 +460,49 @@ def _format_sfd_skipped_report_lines(routine_runs):
         lines.append(f"{routine['name']} ({len(skipped)}):")
         for key in skipped:
             lines.append(f"  - {key}  {jira_issue_url(key)}")
+        lines.append("")
+    return lines
+
+
+def _format_blocking_subtasks_report_lines(routine_runs):
+    """Return the plain-text lines listing the subtasks that kept a task from
+    completing (empty if every task fully completed).
+
+    These are subtasks the run could not bring to a terminal state — typically
+    failures the script could not auto-triage (e.g. an infra/harness failure
+    whose Testray component maps to no valid LPD component, so ticket creation
+    failed). The closure and cleanup passes still ran, but the task was left
+    NOT completed on purpose: this section tells a human exactly what to finish
+    by hand so the next run can complete the task.
+    """
+    actionable = []
+    for entry in routine_runs:
+        if len(entry) < 3:
+            continue
+        routine, summary = entry[0], entry[2]
+        if not summary:
+            continue
+        blocking = summary.get("blocking_subtasks") or []
+        if blocking:
+            actionable.append((routine, summary.get("task_id"), blocking))
+
+    if not actionable:
+        return []
+
+    lines = [
+        "Tasks NOT completed - subtasks needing manual triage before the task "
+        "can close (the closure pass still ran for tickets no longer failing):",
+        "",
+    ]
+    for routine, task_id, blocking in actionable:
+        lines.append(f"{routine['name']} - task {task_id} ({len(blocking)} blocking):")
+        for s in blocking:
+            err = f" - {s['error_preview']}" if s.get("error_preview") else ""
+            lines.append(
+                f"  - subtask {s['id']} [{s['status']}, {s['result_count']} result(s)]"
+                f"{err}"
+            )
+            lines.append(f"    {s['url']}")
         lines.append("")
     return lines
 
@@ -892,41 +938,107 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
 
 def _finalize_task_completion(*, task_id, latest_build_id):
     """
-    If every subtask is in a terminal state, close stale routine tickets and
-    complete the task. Individual subtask completion already happened in
-    _process_task_subtasks.
+    Run the stale-ticket closure and the discarded-parent cleanup, then complete
+    the task IF every subtask is in a terminal state. Individual subtask
+    completion already happened in _process_task_subtasks.
 
     A subtask is terminal when its status is COMPLETE (we analyzed and handled
     it) or MERGED (its case results were consolidated into another subtask, so
     there is nothing left to analyze here — it carries 0 results and the
-    processing loop skips it via `if not results: continue`). Treating only
-    COMPLETE as terminal would leave any task that contains a merged subtask
-    stuck in analysis forever, which in turn permanently blocks the
-    stale-ticket closure pass below.
+    processing loop skips it via `if not results: continue`).
+
+    Degrade gracefully on a partial task. Previously, a single non-terminal
+    subtask (e.g. an infra failure whose Testray component maps to no valid LPD
+    component, so ticket creation fails and the subtask stays OPEN) made this
+    function bail out entirely: no tickets closed, no cleanup, and no signal
+    about what was left to do — the whole run produced nothing useful unless
+    every subtask happened to be handled. Instead we now ALWAYS run the closure
+    and cleanup passes and only gate `complete_task` on full terminal status,
+    reporting the blocking subtasks so a human knows what to finish by hand.
+
+    Closing on a partial task is safe because seen_issue_keys is computed from
+    every issue referenced anywhere in this build's results (result-level AND
+    subtask-level), so a ticket whose test is still failing this build is never
+    a closure candidate even if its subtask hasn't been finalized.
 
     Returns (closure_summary, cleanup_summary):
-      - closure_summary from _close_stale_routine_tasks (tickets the
-        current run closed as 'not reproducible')
-      - cleanup_summary from _cleanup_discarded_parents_subtasks
-        (orphan sub-tasks closed under parents already Discarded)
-    Both are None if the task is not yet complete (nothing attempted).
+      - closure_summary from _close_stale_routine_tasks, augmented with a
+        "blocking_subtasks" list (empty when the task fully completed) and a
+        "task_completed" bool.
+      - cleanup_summary from _cleanup_discarded_parents_subtasks.
     """
     subtasks = get_task_subtasks(task_id)
-    if not all(
-        s.get("dueStatus", {}).get("key") in _TERMINAL_SUBTASK_STATUSES
+    blocking = [
+        s
         for s in subtasks
-    ):
-        print(f"✔ Task {task_id} is not completed. Further processing required.")
-        return None, None
+        if s.get("dueStatus", {}).get("key") not in _TERMINAL_SUBTASK_STATUSES
+    ]
 
-    seen_issue_keys = _collect_issue_keys_from_subtasks(subtasks)
+    seen_issue_keys = _collect_all_seen_issue_keys(subtasks)
     closure_summary = _close_stale_routine_tasks(latest_build_id, seen_issue_keys)
     cleanup_summary = _cleanup_discarded_parents_subtasks()
 
-    print(f"✔ All subtasks are complete, completing task {task_id}")
-    complete_task(task_id)
-    print(f"✔ Task {task_id} is now complete. No further processing required.")
+    closure_summary["task_id"] = task_id
+    closure_summary["blocking_subtasks"] = _describe_blocking_subtasks(blocking, task_id)
+
+    if blocking:
+        closure_summary["task_completed"] = False
+        print(
+            f"⚠ Task {task_id} has {len(blocking)} non-terminal subtask(s); "
+            f"closure and cleanup ran, but the task is NOT marked complete. "
+            f"See the blocking-subtasks report for manual follow-up."
+        )
+    else:
+        closure_summary["task_completed"] = True
+        print(f"✔ All subtasks are terminal, completing task {task_id}")
+        complete_task(task_id)
+        print(f"✔ Task {task_id} is now complete. No further processing required.")
+
     return closure_summary, cleanup_summary
+
+
+def _collect_all_seen_issue_keys(subtasks):
+    """Union of every Jira key referenced in this build, at both the subtask
+    level (`subtask.issues`) and the result level (`result.issues`).
+
+    Used to protect tickets from the not-reproducible closure pass: a ticket
+    whose test still failed this build is referenced somewhere in these results,
+    so collecting result-level keys too keeps closure safe even when the task is
+    only partially triaged (some subtasks not yet finalized).
+    """
+    seen = _collect_issue_keys_from_subtasks(subtasks)
+    for subtask in subtasks:
+        seen |= _collect_result_issue_keys(get_subtask_case_results(subtask["id"]))
+    return seen
+
+
+def _describe_blocking_subtasks(blocking, task_id):
+    """Build a report-friendly description of the subtasks that prevent the task
+    from completing: for each, its link, status, result count and a
+    representative error, so a human knows what to triage by hand.
+    """
+    described = []
+    for subtask in blocking:
+        subtask_id = subtask["id"]
+        results = get_subtask_case_results(subtask_id)
+        error_preview = next(
+            (
+                (r.get("errors") or "").strip().splitlines()[0]
+                for r in results
+                if (r.get("errors") or "").strip()
+            ),
+            "",
+        )
+        described.append(
+            {
+                "id": subtask_id,
+                "status": subtask.get("dueStatus", {}).get("key"),
+                "url": testray_subtask_url(subtask_id, task_id),
+                "result_count": len(results),
+                "error_preview": error_preview[:160],
+            }
+        )
+    return described
 
 
 def _is_subtask_complete(subtask):
