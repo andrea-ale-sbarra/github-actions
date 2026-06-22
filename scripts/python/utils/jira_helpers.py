@@ -18,31 +18,69 @@ def is_valid_jira_key(issue_key):
     return bool(issue_key and _JIRA_KEY_RE.match(issue_key.strip()))
 
 
+CLOSE_OK = "closed"
+CLOSE_SKIPPED_SFD_NO_SUBTASKS = "sfd_no_subtasks"
+CLOSE_SKIPPED_PARENT_ACTIVE = "parent_active"
+CLOSE_SKIPPED_ACTIVE_SUBTASK = "active_subtask"
+CLOSE_FAILED = "failed"
+
+
+def _is_selected_for_development(status_name):
+    """Locale-tolerant match for the 'Selected for Development' workflow state.
+
+    Status names returned by Jira are localized to the requesting account's
+    language, but this particular workflow step is configured without a
+    translation in the Liferay instance, so a normalized name comparison is
+    safe. Should that ever change, swap the comparison for a JQL-based check.
+    """
+    def norm(s):
+        return s.lower().replace(" ", "").replace("-", "")
+
+    return norm(status_name or "") == norm("Selected for Development")
+
+
 def close_issue(issue_key, build_hash):
     """
-    Final optimized flow:
-    1. Load issue
-    2. Inspect subtasks via status category (locale-independent):
-       - 'done'          → already closed, skip
-       - 'new'           → safe to close (Open / To Do / Backlog / Selected for Development / …)
-       - 'indeterminate' → ABORT parent: a sub-task is actively being worked on
-       - anything else   → ABORT parent: unknown state, play it safe
-    3. Close every 'new'-category subtask, recording its original status
-       in the closing comment. If any close fails, ABORT the parent so
-       parent and sub-task never diverge.
-    4. Move parent to 'Selected for Development'
-    5. Close parent with resolution 'Discarded'
+    Close a routine investigation ticket as Discarded ("not reproducible").
 
-    Returns True if the parent issue was actually closed (or would be in
-    DRY_RUN mode), False otherwise (active/unknown subtask, failed
-    sub-task close, missing transition, exception). The boolean lets
-    callers report which tickets were closed by the current run.
+    Flow:
+    1. Load parent.
+    2. If the parent's status category is 'indeterminate' (In Progress,
+       In Review, …), someone is actively working on the ticket — leave
+       it alone (return CLOSE_SKIPPED_PARENT_ACTIVE). The bot never
+       auto-closes work humans are mid-flight on.
+    3. Special case: if the parent is in 'Selected for Development'
+       AND has no sub-tasks, leave it alone. Reaching SFD requires
+       either a human action or a previous bot pass; either way,
+       expected sub-tasks should already exist. Their absence means
+       something is off — punt to a human via the run report (return
+       CLOSE_SKIPPED_SFD_NO_SUBTASKS).
+    4. Inspect sub-tasks by locale-independent status category:
+       - 'done'          → already closed, skip
+       - 'new'           → close as Discarded
+       - 'indeterminate' → active work, abort (return CLOSE_SKIPPED_ACTIVE_SUBTASK)
+       - anything else   → unknown state, abort (return CLOSE_SKIPPED_ACTIVE_SUBTASK)
+    5. Close 'new' sub-tasks. If any sub-task close fails, abort
+       (CLOSE_FAILED) so parent and sub-task never diverge.
+    6. Close the parent directly: find a 'Closed' transition reachable
+       from the current state (no detour through 'Selected for
+       Development'). Skipping the SFD detour avoids triggering the
+       Jira automation that creates skeleton sub-tasks asynchronously
+       — historically a race that left orphan sub-tasks under a
+       freshly Discarded parent.
+
+    Returns one of:
+      CLOSE_OK                          parent closed (or would be in DRY_RUN)
+      CLOSE_SKIPPED_PARENT_ACTIVE       parent in an indeterminate status
+      CLOSE_SKIPPED_SFD_NO_SUBTASKS     parent in SFD with no sub-tasks
+      CLOSE_SKIPPED_ACTIVE_SUBTASK      sub-task active/unknown
+      CLOSE_FAILED                      transition missing or exception raised
     """
 
     try:
         if os.getenv("DRY_RUN", "false").lower() == "true":
             print(f"[DRY RUN] Would close Jira issue: {issue_key} → {jira_issue_url(issue_key)}")
-            return True
+            return CLOSE_OK
 
         jira = _jira()
 
@@ -51,13 +89,39 @@ def close_issue(issue_key, build_hash):
         # -----------------------------------------
         parent_issue = jira.issue(issue_key)
         current_status = parent_issue.fields.status.name
-
-        print(f"\nℹ Processing {issue_key} (current status: {current_status})")
-
-        # -----------------------------------------
-        # STEP 1: Inspect subtasks by status category
-        # -----------------------------------------
+        current_category = getattr(
+            getattr(parent_issue.fields.status, "statusCategory", None), "key", None
+        )
         subtasks = getattr(parent_issue.fields, "subtasks", [])
+
+        print(
+            f"\nℹ Processing {issue_key} "
+            f"(current status: {current_status}, sub-tasks: {len(subtasks)})"
+        )
+
+        # -----------------------------------------
+        # STEP 1: Parent in an indeterminate status → don't touch
+        # -----------------------------------------
+        if current_category == "indeterminate":
+            print(
+                f"⚠ {issue_key} is in '{current_status}' (someone is working on it). "
+                f"Leaving untouched."
+            )
+            return CLOSE_SKIPPED_PARENT_ACTIVE
+
+        # -----------------------------------------
+        # STEP 2: SFD without sub-tasks → leave for human review
+        # -----------------------------------------
+        if _is_selected_for_development(current_status) and not subtasks:
+            print(
+                f"⚠ {issue_key} is in '{current_status}' with no sub-tasks. "
+                f"Leaving open for manual review."
+            )
+            return CLOSE_SKIPPED_SFD_NO_SUBTASKS
+
+        # -----------------------------------------
+        # STEP 2: Inspect sub-tasks by status category
+        # -----------------------------------------
         subtasks_to_close = []  # list of (key, original_status_name)
         blocked = False
 
@@ -86,12 +150,13 @@ def close_issue(issue_key, build_hash):
 
         if blocked:
             print(f"⛔ {issue_key} will NOT be touched due to active/unknown subtasks.")
-            return False
+            return CLOSE_SKIPPED_ACTIVE_SUBTASK
 
-        print(f"✔ Subtasks valid ({len(subtasks_to_close)} to close). Proceeding.")
+        if subtasks_to_close:
+            print(f"✔ Sub-tasks valid ({len(subtasks_to_close)} to close). Proceeding.")
 
         # -----------------------------------------
-        # STEP 2: Close every safe subtask
+        # STEP 3: Close every safe sub-task
         # -----------------------------------------
         for subtask_key, original_status in subtasks_to_close:
             print(f"→ Closing child {subtask_key} (was '{original_status}')")
@@ -100,45 +165,23 @@ def close_issue(issue_key, build_hash):
                     f"⛔ Could not close sub-task {subtask_key}. "
                     f"Aborting parent {issue_key} to keep parent/sub-task consistent."
                 )
-                return False
+                return CLOSE_FAILED
 
         # -----------------------------------------
-        # STEP 3: Move parent to "Selected for Development"
-        # -----------------------------------------
-        if current_status != "Selected for Development":
-            transitions = jira.transitions(issue_key)
-
-            def norm(s):
-                return s.lower().replace(" ", "").replace("-", "")
-
-            target = norm("Selected for Development")
-
-            selected_dev_transition = next(
-                (
-                    t
-                    for t in transitions
-                    if norm(t.get("to", {}).get("name", "")) == target
-                ),
-                None,
-            ) or next(
-                (t for t in transitions if target in norm(t["name"])),
-                None,
-            )
-
-            if selected_dev_transition:
-                jira.transition_issue(issue_key, selected_dev_transition["id"])
-                print(f"✔ {issue_key} → '{selected_dev_transition['name']}'")
-                parent_issue = jira.issue(issue_key)
-            else:
-                print("⚠ No transition to 'Selected for Development' found.")
-        else:
-            print(f"✔ {issue_key} already in 'Selected for Development'")
-
-        # -----------------------------------------
-        # STEP 4: Close parent issue
+        # STEP 4: Close parent directly from current state
         # -----------------------------------------
         transitions = jira.transitions(issue_key)
-        close_transition = next((t for t in transitions if t["name"] == "Closed"), None)
+        close_transition = next(
+            (t for t in transitions if t.get("name") == "Closed"),
+            None,
+        ) or next(
+            (
+                t
+                for t in transitions
+                if t.get("to", {}).get("statusCategory", {}).get("key") == "done"
+            ),
+            None,
+        )
 
         if close_transition:
             jira.transition_issue(
@@ -147,15 +190,21 @@ def close_issue(issue_key, build_hash):
                 resolution={"name": "Discarded"},
             )
             jira.add_comment(issue_key, f"Closed. Not reproducible in SHA {build_hash}")
-            print(f"✔ {issue_key} → Closed with resolution 'Discarded'")
-            return True
+            print(
+                f"✔ {issue_key} → '{close_transition['name']}' with "
+                f"'Discarded' (direct from '{current_status}')"
+            )
+            return CLOSE_OK
         else:
-            print("✘ Could not find 'Closed' transition for parent.")
-            return False
+            print(
+                f"✘ Could not find a 'Closed'/done transition for parent "
+                f"{issue_key} from '{current_status}'."
+            )
+            return CLOSE_FAILED
 
     except Exception as e:
         print(f"✘ Failed to process issue {issue_key}: {e}")
-        return False
+        return CLOSE_FAILED
 
 
 def create_jira_task(epic, summary, description, component, label, due_date=None, priority=None, routine_label=None):

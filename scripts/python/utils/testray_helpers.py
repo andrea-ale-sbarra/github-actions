@@ -18,6 +18,9 @@ from jira_helpers import (
     get_all_issues,
     close_issue,
     close_orphan_subtasks_of_discarded,
+    CLOSE_OK,
+    CLOSE_SKIPPED_PARENT_ACTIVE,
+    CLOSE_SKIPPED_SFD_NO_SUBTASKS,
     is_valid_jira_key,
     jira_issue_url,
 )
@@ -82,6 +85,13 @@ ANALYZED_ROUTINES = (
         "check_label": "um_check_failures",
     },
 )
+
+
+# Subtask statuses that count as "nothing left to do here" when deciding
+# whether a task is fully analyzed: COMPLETE (analyzed/handled) and MERGED
+# (consolidated into another subtask — carries 0 results). See
+# _finalize_task_completion for why MERGED must be treated as terminal.
+_TERMINAL_SUBTASK_STATUSES = frozenset({"COMPLETE", "MERGED"})
 
 
 def select_routines():
@@ -240,6 +250,7 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
 
     section3 = _format_closure_report_lines(routine_runs)
     section3b = _format_cleanup_report_lines(routine_runs)
+    section3c = _format_sfd_skipped_report_lines(routine_runs)
 
     section4 = []
     pr_blocks = []
@@ -262,6 +273,7 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
         *section2,
         *section3,
         *section3b,
+        *section3c,
         *section4,
     ]
 
@@ -359,7 +371,16 @@ def _format_closure_report_lines(routine_runs, recent_build_window=20):
         build_id = summary.get("build_id")
         closed = summary.get("closed", [])
         attempted = summary.get("attempted", [])
-        skipped = [k for k in attempted if k not in closed]
+        # Intentional skips (parent in progress, parent in SFD without
+        # sub-tasks) are reported in their own sections — keep them out
+        # of the "Attempted but NOT closed" list, which is for unexpected
+        # failures only.
+        intentional_skips = set(summary.get("skipped_parent_active", [])) | set(
+            summary.get("skipped_sfd_no_subtasks", [])
+        )
+        skipped = [
+            k for k in attempted if k not in closed and k not in intentional_skips
+        ]
 
         lines.append(f"{routine['name']}  build {build_id} (SHA {sha_short})")
 
@@ -400,6 +421,43 @@ def _format_closure_report_lines(routine_runs, recent_build_window=20):
 
         lines.append("")
 
+    return lines
+
+
+def _format_sfd_skipped_report_lines(routine_runs):
+    """Return the plain-text lines listing tickets the closure pass left
+    open because they were in 'Selected for Development' with no
+    sub-tasks (empty if nothing to report).
+
+    These tickets need a human to look: SFD-without-subtasks usually
+    means the Jira automation that auto-creates the work breakdown
+    didn't fire as expected, so the bot intentionally backs off rather
+    than closing a parent that has no recorded sub-task history.
+    """
+    actionable = []
+    for entry in routine_runs:
+        if len(entry) < 3:
+            continue
+        routine, summary = entry[0], entry[2]
+        if not summary:
+            continue
+        skipped = summary.get("skipped_sfd_no_subtasks") or []
+        if skipped:
+            actionable.append((routine, skipped))
+
+    if not actionable:
+        return []
+
+    lines = [
+        "Tickets left open - in 'Selected for Development' with no sub-tasks "
+        "(review manually):",
+        "",
+    ]
+    for routine, skipped in actionable:
+        lines.append(f"{routine['name']} ({len(skipped)}):")
+        for key in skipped:
+            lines.append(f"  - {key}  {jira_issue_url(key)}")
+        lines.append("")
     return lines
 
 
@@ -834,8 +892,17 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
 
 def _finalize_task_completion(*, task_id, latest_build_id):
     """
-    If all subtasks are COMPLETE, close stale routine tickets and complete the task.
-    Individual subtask completion already happened in _process_task_subtasks.
+    If every subtask is in a terminal state, close stale routine tickets and
+    complete the task. Individual subtask completion already happened in
+    _process_task_subtasks.
+
+    A subtask is terminal when its status is COMPLETE (we analyzed and handled
+    it) or MERGED (its case results were consolidated into another subtask, so
+    there is nothing left to analyze here — it carries 0 results and the
+    processing loop skips it via `if not results: continue`). Treating only
+    COMPLETE as terminal would leave any task that contains a merged subtask
+    stuck in analysis forever, which in turn permanently blocks the
+    stale-ticket closure pass below.
 
     Returns (closure_summary, cleanup_summary):
       - closure_summary from _close_stale_routine_tasks (tickets the
@@ -845,7 +912,10 @@ def _finalize_task_completion(*, task_id, latest_build_id):
     Both are None if the task is not yet complete (nothing attempted).
     """
     subtasks = get_task_subtasks(task_id)
-    if not all(s.get("dueStatus", {}).get("key") == "COMPLETE" for s in subtasks):
+    if not all(
+        s.get("dueStatus", {}).get("key") in _TERMINAL_SUBTASK_STATUSES
+        for s in subtasks
+    ):
         print(f"✔ Task {task_id} is not completed. Further processing required.")
         return None, None
 
@@ -1069,6 +1139,8 @@ def _close_stale_routine_tasks(latest_build_id, seen_issue_keys):
         "build_hash": None,
         "attempted": [],
         "closed": [],
+        "skipped_sfd_no_subtasks": [],
+        "skipped_parent_active": [],
     }
 
     routine = _get_routine_config(_CURRENT_ROUTINE_ID)
@@ -1097,8 +1169,13 @@ def _close_stale_routine_tasks(latest_build_id, seen_issue_keys):
             f"ℹ Found {len(to_close)} issues to close as they are not reproducible in this run."
         )
         for issue_key in to_close:
-            if close_issue(issue_key, build_hash):
+            result = close_issue(issue_key, build_hash)
+            if result == CLOSE_OK:
                 summary["closed"].append(issue_key)
+            elif result == CLOSE_SKIPPED_SFD_NO_SUBTASKS:
+                summary["skipped_sfd_no_subtasks"].append(issue_key)
+            elif result == CLOSE_SKIPPED_PARENT_ACTIVE:
+                summary["skipped_parent_active"].append(issue_key)
     return summary
 
 
