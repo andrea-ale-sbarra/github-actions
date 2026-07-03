@@ -295,7 +295,7 @@ def create_jira_task(epic, summary, description, component, label, due_date=None
 
     label_to_apply = routine_label or os.getenv("ROUTINE_LABEL", "routine_tasks")
     _jira().issue(new_issue.key).update(
-        update={"labels": [{"add": label_to_apply}]}
+        update={"labels": [{"add": label_to_apply}, {"add": "unplanned_work"}]}
     )
     if label:
         _jira().issue(new_issue.key).update(update={"labels": [{"add": label}]})

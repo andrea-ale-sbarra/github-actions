@@ -44,14 +44,14 @@ while (( $# > 0 )); do
     case "$1" in
         --live) export DRY_RUN=false ;;
         --resume) export RESUME=true ;;
-        --priorities|--summary|--diagnose|--inspect|--check-pr-failures) SUBCOMMAND="$1" ;;
+        --priorities|--summary|--diagnose|--inspect|--check-pr-failures|--poshi-burndown) SUBCOMMAND="$1" ;;
         --routine) shift; export ROUTINE="$1" ;;
         --routine=*) export ROUTINE="${1#--routine=}" ;;
         --build) shift; SUBCOMMAND="--build"; BUILD_IDS+=("$1") ;;
         --build=*) SUBCOMMAND="--build"; BUILD_IDS+=("${1#--build=}") ;;
         *)
             echo "❌ Argomento non riconosciuto: $1"
-            echo "   Usa: --live | --resume | --routine <name|id> | --priorities | --summary | --inspect | --diagnose | --check-pr-failures | --build <id>"
+            echo "   Usa: --live | --resume | --routine <name|id> | --priorities | --summary | --inspect | --diagnose | --check-pr-failures | --poshi-burndown | --build <id>"
             exit 1
             ;;
     esac
@@ -93,6 +93,12 @@ if [[ "$SUBCOMMAND" == "--check-pr-failures" ]]; then
     fi
     cd "$SCRIPT_DIR"
     uv run check_pr_failures.py
+    exit 0
+fi
+if [[ "$SUBCOMMAND" == "--poshi-burndown" ]]; then
+    echo "📉 Conteggio Poshi rimasti da convertire (scan dei file sorgente)..."
+    cd "$SCRIPT_DIR"
+    uv run poshi_burndown.py
     exit 0
 fi
 if [[ "$SUBCOMMAND" == "--build" ]]; then

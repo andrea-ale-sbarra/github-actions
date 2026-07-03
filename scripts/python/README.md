@@ -42,6 +42,7 @@ These replace the main analyzer, they don't run alongside it.
 | `--build <id> [<id> ...]` | `inspect_builds.py <ids>` | Inspects specific builds by id. Useful when a build appears in the Testray UI but isn't returned by the routine's API |
 | `--check-pr-failures` | `check_pr_failures.py` | For every Jira ticket tagged with the routine's `check_label` (`commerce_check_failures` / `um_check_failures`), scans the ticket's comments for the final reviewer's "View total diff: `<base>...<head>`" link, calls GitHub's compare endpoint for the file list, finds the Acceptance build whose `gitHash` matches `<head>`, and prints a Slack-ready block with each touched test file's status (PASSED / FAILED / BLOCKED / NOT FOUND). Read-only |
 | `--priorities` | `discover_jira_priorities.py` | Lists the Jira priorities defined in the instance and the ones allowed on LPD/Task. Use it when updating `_PRIORITY_LADDER` in `utils/testray_helpers.py` |
+| `--poshi-burndown` | `poshi_burndown.py` | Scans the Poshi `.testcase` source files and reports, per file, how many `test {}` blocks are left to convert — live tests vs dead `@ignore` stubs. The count is file-based on purpose (the migration target is every test still in the tree, not just what Testray ran). Read-only. The same block is also folded into the tail of the main run's recap. Override the scanned directory with `POSHI_TESTS_DIR` or a path arg |
 
 ### Examples
 
@@ -63,6 +64,9 @@ These replace the main analyzer, they don't run alongside it.
 
 # Inspect the most recent Commerce builds
 ./run_local.sh --inspect --routine commerce
+
+# How many Poshi tests are left to convert (per file)
+./run_local.sh --poshi-burndown
 
 # Inspect two specific builds by id
 ./run_local.sh --build 470911677 --build 470910001

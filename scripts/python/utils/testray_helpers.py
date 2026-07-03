@@ -184,7 +184,9 @@ def analyze_testflow(builds, routine_id):
         _CURRENT_ROUTINE_ID = previous_routine_id
 
 
-def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
+def print_slack_summary(
+    routine_runs, pr_check_by_routine_id=None, extra_tail_lines=None
+):
     """
     Print one plain-text recap covering every routine analyzed in this run.
 
@@ -215,6 +217,11 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
     `pr_check_by_routine_id` (optional) maps routine id → list of PR
     check result dicts (see `utils.pr_check.check_pr_failures_for_routine`).
     When provided, the "test analysis" section is appended at the end.
+
+    `extra_tail_lines` (optional) is a list of plain-text lines appended
+    verbatim at the very end of the copy-paste block — used to fold the
+    Poshi conversion burndown into the recap without coupling this function
+    to its computation.
 
     No Slack mrkdwn is emitted: links are rendered as plain URLs so the
     block can be copy-pasted into any chat client without rewriting.
@@ -278,6 +285,7 @@ def print_slack_summary(routine_runs, pr_check_by_routine_id=None):
         *section3c,
         *section3d,
         *section4,
+        *(extra_tail_lines or []),
     ]
 
     message = "\n".join(lines)

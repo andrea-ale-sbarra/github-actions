@@ -8,6 +8,7 @@ from utils.testray_helpers import (
 )
 from utils.testray_api import get_routine_to_builds
 from utils.pr_check import MODE_FULL, check_pr_failures_for_routine
+from poshi_burndown import format_burndown_lines
 
 import os
 
@@ -35,4 +36,12 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"PR review check failed for {routine['name']}: {e}")
 
-    print_slack_summary(routine_runs, pr_check_by_routine_id)
+    # Poshi conversion burndown: read-only file scan, folded into the recap.
+    # Wrapped so a missing/relocated tests dir never loses the analysis recap.
+    try:
+        burndown_lines = ["", *format_burndown_lines()]
+    except Exception as e:
+        print(f"Poshi burndown skipped: {e}")
+        burndown_lines = None
+
+    print_slack_summary(routine_runs, pr_check_by_routine_id, burndown_lines)
