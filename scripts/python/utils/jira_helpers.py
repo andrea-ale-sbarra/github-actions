@@ -332,6 +332,24 @@ def get_all_issues(jql_str, fields):
     return issues
 
 
+def add_comment(issue_key, comment):
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        print(f"[DRY RUN] Would comment on {issue_key} → {jira_issue_url(issue_key)}")
+        return
+
+    _jira().add_comment(issue_key, comment)
+
+
+def get_issue_text(issue_key):
+    """Return the description and every comment body of an issue, joined."""
+    issue = _jira().issue(issue_key, fields="description,comment")
+
+    parts = [issue.fields.description or ""]
+    parts.extend(c.body or "" for c in issue.fields.comment.comments)
+
+    return "\n".join(parts)
+
+
 def get_issue_type_by_key(issue_key):
     try:
         issue = _jira().issue(issue_key, fields="issuetype")

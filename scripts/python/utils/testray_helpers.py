@@ -12,6 +12,8 @@ from sentence_transformers import SentenceTransformer, util
 from functools import lru_cache
 from types import SimpleNamespace
 from jira_helpers import (
+    add_comment,
+    get_issue_text,
     get_issue_status_by_key,
     get_issue_type_by_key,
     create_jira_task,
@@ -49,6 +51,7 @@ from testray_api import (
     get_case_type_id_by_name,
     get_case_count_by_type_in_build,
     get_case_info,
+    testray_build_url,
     get_case_type_name,
     get_routine_to_builds,
 )
@@ -834,6 +837,25 @@ def _normalize_error(error):
     return error
 
 
+def _normalize_error_keep_locator(error):
+    """Like _normalize_error, but keeps quoted strings.
+
+    For Poshi the quoted string is the locator, the only part that tells two
+    "Element is not present" failures apart. Long digit runs are masked
+    because generated names (e.g. "Minium-1401984138") differ on every run.
+    """
+    if not error:
+        return ""
+
+    error = " ".join(error.strip().split())
+    error = re.sub(r"\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}", "", error)
+    error = re.sub(r"0x[0-9A-Fa-f]+", "", error)
+    error = re.sub(r"\d+\s*(ms|s|seconds|minutes|m)\b", "", error)
+    error = re.sub(r"\d{4,}", "#", error)
+
+    return error
+
+
 def _parse_execution_date(date_str):
     date_str = date_str.strip().rstrip("Z").replace("T", " ")
 
@@ -1157,6 +1179,7 @@ def _resolve_unique_failures(
             _blocked_update(f["result_id"], blocked_dict["dueStatus"], issue_keys_str)
             for f in unique_failures
         ]
+        _comment_new_tests_on_issues(issue_keys_str, unique_failures, latest_build_id)
         return updates, issue_keys_str, True
 
     # Otherwise, create a brand-new investigation task for this group
@@ -1638,19 +1661,27 @@ def _find_similar_open_issues(case_id, result_error, *, return_list=False):
     return [] if return_list else (False, None)
 
 
-_INVESTIGATE_SUMMARY_RE = re.compile(
-    r"^(?:\[[^\]]+\]\s+)?Investigate\s+(.*?)(?:\.{3})?\s*$"
-)
+_JIRA_CODE_BLOCK_RE = re.compile(r"\{code\}(.*?)\{code\}", re.DOTALL)
 
 
-def _find_existing_open_ticket_for_error(epic, error_text):
+def _find_existing_open_ticket_for_error(epic, case_names, errors):
     """
-    Pre-creation dedup: search Jira for an already-open routine task whose
-    summary describes the same error semantically. Catches the case where the
-    case-result history lookup misses a ticket (e.g. issues field never
-    persisted on the previous result, or autofill didn't run).
+    Pre-creation dedup: search Jira for an already-open routine task that
+    covers one of the failing tests, or the same error. Catches the case
+    where the case-result history lookup misses a ticket (e.g. issues field
+    never persisted on the previous result, or autofill didn't run).
+
+    A ticket matches when its description lists one of `case_names`, or
+    carries one of `errors` in a {code} block, locator included. The summary
+    is not used: Jira cuts it before the locator, so every open Poshi
+    "Element is not present" ticket would look like the same error.
     Returns the existing issue key, or None.
     """
+    case_names = [name for name in case_names if name and name != "N/A"]
+    new_errors = {_normalize_error_keep_locator(e) for e in errors if e}
+    if not case_names and not new_errors:
+        return None
+
     routine = _get_routine_config(_CURRENT_ROUTINE_ID)
     routine_label = (
         routine["routine_label"] if routine
@@ -1666,32 +1697,81 @@ def _find_existing_open_ticket_for_error(epic, error_text):
     jql = " AND ".join(jql_parts)
 
     try:
-        candidates = get_all_issues(jql, fields=["summary"])
+        candidates = get_all_issues(jql, fields=["description"])
     except Exception as e:
         print(f"⚠ JQL pre-creation dedup lookup failed ({e}); proceeding to create.")
         return None
 
-    if not candidates:
-        return None
-
-    new_marker = (error_text or "")[:80]
-    new_norm = _normalize_error(error_text or "")
-
     for c in candidates:
-        summary = (getattr(c.fields, "summary", None) or "").strip()
-        if new_marker and new_marker in summary:
+        description = getattr(c.fields, "description", None) or ""
+
+        if any(name in description for name in case_names):
             return c.key
 
-        m = _INVESTIGATE_SUMMARY_RE.match(summary)
-        if not m:
-            continue
-        candidate_error = m.group(1).strip()
-        if not candidate_error:
-            continue
-        if _are_errors_similar(new_norm, _normalize_error(candidate_error)):
+        candidate_errors = {
+            _normalize_error_keep_locator(block)
+            for block in _JIRA_CODE_BLOCK_RE.findall(description)
+        }
+        if new_errors & candidate_errors:
             return c.key
 
     return None
+
+
+def _comment_new_tests_on_issues(issue_keys_str, unique_failures, build_id):
+    """
+    When failures are attached to an existing ticket, comment the tests the
+    ticket does not mention yet, so Jira lists every test the ticket blocks
+    in Testray and not only the ones it was opened for.
+    """
+    case_names = sorted(
+        {
+            name
+            for name in (
+                get_case_info(f["case_id"]).get("name") for f in unique_failures
+            )
+            if name and name != "N/A"
+        }
+    )
+    if not case_names:
+        return
+
+    for issue_key in (k.strip() for k in (issue_keys_str or "").split(",")):
+        if not is_valid_jira_key(issue_key):
+            continue
+
+        try:
+            issue_text = get_issue_text(issue_key)
+        except Exception as e:
+            print(f"⚠ Could not read {issue_key} to report new tests: {e}")
+            continue
+
+        missing = [name for name in case_names if name not in issue_text]
+        if not missing:
+            continue
+
+        errors = sorted(
+            {
+                f["error"]
+                for f in unique_failures
+                if get_case_info(f["case_id"]).get("name") in missing
+            }
+        )
+
+        lines = [
+            f"These tests are also failing in [Testray build {build_id}|{testray_build_url(build_id, _CURRENT_ROUTINE_ID)}] and are now tracked by this ticket:",
+            "",
+        ]
+        lines.extend(f"* {name}" for name in missing)
+        lines.append("")
+        lines.append("h3. Error")
+        lines.extend(f"{{code}}{error}{{code}}" for error in errors)
+
+        try:
+            add_comment(issue_key, "\n".join(lines))
+            print(f"✔ Reported {len(missing)} new test(s) on {issue_key}")
+        except Exception as e:
+            print(f"⚠ Could not comment new tests on {issue_key}: {e}")
 
 
 def _report_poshi_tests_decrease(start_of_quarter_count, current_count):
@@ -2126,7 +2206,14 @@ def _create_investigation_task_for_subtask(
         summary_prefix.append("ACCEPTANCE")
 
     prefix = f"[{'/'.join(summary_prefix)}] " if summary_prefix else ""
-    summary = f"{prefix}Investigate {first_error[:80]}..."
+    # Drop the leading exception class so the summary shows what failed: for
+    # Poshi the class name alone takes 70 characters and hides the locator.
+    summary_error = re.sub(
+        r"^[\w.$]+(?:Exception|Error):\s*", "", " ".join(first_error.split())
+    )
+    if len(summary_error) > 150:
+        summary_error = summary_error[:150] + "..."
+    summary = f"{prefix}Investigate {summary_error}"
 
     description = "\n".join(description_lines + flow_intro)
 
@@ -2181,11 +2268,21 @@ def _create_investigation_task_for_subtask(
     )
     priority = _priority_for_days(max_days_failing)
 
-    existing_key = _find_existing_open_ticket_for_error(epic, first_error)
+    existing_key = _find_existing_open_ticket_for_error(
+        epic,
+        [
+            get_case_info(f["case_id"]).get("name")
+            for f in subtask_unique_failures
+        ],
+        [f["error"] for f in subtask_unique_failures],
+    )
     if existing_key:
         print(
             f"♻ Reusing existing open ticket {existing_key} for subtask {subtask_id} "
-            f"(matched on Jira summary similarity → skipping creation)"
+            f"(matched on failing test or error with locator → skipping creation)"
+        )
+        _comment_new_tests_on_issues(
+            existing_key, subtask_unique_failures, latest_build_id
         )
         return SimpleNamespace(key=existing_key)
 
