@@ -632,8 +632,9 @@ def report_aft_ratio_for_latest(builds):
     Compute and print AFT ratio KPI for latest DONE build vs beginning of quarter.
     (Same behavior as your previous get_automated_functional_tests_ratio flow, centralized here.)
     """
-    latest_build = _get_latest_done_build(builds)
+    latest_build = _get_latest_done_build(builds, quiet=True)
     if not latest_build:
+        print("✘ Skipping AFT ratio KPI: the latest build's import is not DONE.")
         return
 
     # Beginning-of-quarter build discovery
@@ -676,13 +677,33 @@ def report_aft_ratio_for_latest(builds):
     _report_poshi_tests_decrease(start_of_quarter_count, current_count)
 
 
-def _get_latest_done_build(builds):
-    """Return the newest build only if its import status is DONE; else None."""
+def _get_latest_done_build(builds, quiet=False):
+    """Return the newest build only if its import status is DONE; else None.
+
+    'DONE' here is the build's importStatus, i.e. whether Testray has finished
+    importing the Jenkins results — not the outcome of the tests. A build whose
+    import is still running exposes only part of its failures, so analyzing it
+    would open tickets for noise and close tickets that only look fixed.
+    """
     if not builds:
         return None
     latest_build = builds[0]
-    if latest_build.get("importStatus", {}).get("key") != "DONE":
-        print(f"✘ Latest build '{latest_build.get('name')}' is not DONE.")
+    import_status = (latest_build.get("importStatus") or {}).get("key")
+    if import_status != "DONE":
+        if not quiet:
+            print(
+                f"✘ Skipping build '{latest_build.get('name')}' "
+                f"(id={latest_build.get('id')}): Testray import status is "
+                f"{import_status or 'UNKNOWN'}, not DONE. The results are still "
+                f"being imported, so only part of the failures would be visible "
+                f"and the analysis would file/close the wrong tickets."
+            )
+            print(
+                "  → Re-run once the import finishes. "
+                "'./run_local.sh --inspect' shows importStatus per build; "
+                "'./run_local.sh --resume' analyzes an older build whose task "
+                "is still open instead of waiting for this one."
+            )
         return None
     return latest_build
 
