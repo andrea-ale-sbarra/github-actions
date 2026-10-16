@@ -1401,17 +1401,31 @@ def _cleanup_discarded_parents_subtasks():
         f"AND statusCategory = Done "
         f"AND resolution = Discarded"
     )
-    parents = get_all_issues(jql, fields=["key"])
+    parents = get_all_issues(jql, fields=["subtasks"])
     summary["parents_scanned"] = len(parents)
     if not parents:
         return summary
 
+    # The search already carries each sub-task's status, so only parents
+    # with a sub-task still open need the per-parent fetch and close pass.
+    # Most Discarded parents have none, and fetching them one by one cost
+    # about half a second each on every run.
+    parents_with_open_subtasks = [
+        parent
+        for parent in parents
+        if any(
+            subtask.fields.status.statusCategory.key != "done"
+            for subtask in getattr(parent.fields, "subtasks", None) or []
+        )
+    ]
+
     print(
-        f"ℹ Cleanup pass: scanning {len(parents)} Discarded parent(s) "
-        f"with label '{routine_label}' for orphan sub-tasks."
+        f"ℹ Cleanup pass: {len(parents_with_open_subtasks)} of "
+        f"{len(parents)} Discarded parent(s) with label '{routine_label}' "
+        f"have open sub-tasks."
     )
 
-    for parent in parents:
+    for parent in parents_with_open_subtasks:
         parent_summary = close_orphan_subtasks_of_discarded(parent.key)
         touched = (
             parent_summary["closed"]
