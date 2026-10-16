@@ -318,30 +318,21 @@ def create_jira_task(epic, summary, description, component, label, due_date=None
 
 
 def get_all_issues(jql_str, fields):
-    issues = []
-    i = 0
-    chunk_size = 50
-    while True:
-        chunk = _jira().search_issues(
-            jql_str, startAt=i, maxResults=chunk_size, fields=fields
-        )
-        i += chunk_size
-        issues += chunk.iterable
-        if i >= chunk.total:
-            break
-    return issues
-
-
-def count_issues(jql_str):
-    """Return how many issues match `jql_str`.
+    """Return every issue matching `jql_str`, across all result pages.
 
     On Jira Cloud the search goes through the enhanced (token-paginated)
     API, whose `.total` is only the size of the returned page — not the
-    match count. So fetch every page (keys only) and count them.
+    match count — and offset paging (`startAt`) is rejected. Passing
+    maxResults=False lets the library follow the page tokens to the end.
     """
-    return len(
-        _jira().enhanced_search_issues(jql_str, maxResults=False, fields="key")
+    return list(
+        _jira().enhanced_search_issues(jql_str, maxResults=False, fields=fields)
     )
+
+
+def count_issues(jql_str):
+    """Return how many issues match `jql_str`."""
+    return len(get_all_issues(jql_str, fields="key"))
 
 
 def add_comment(issue_key, comment):
