@@ -332,6 +332,18 @@ def get_all_issues(jql_str, fields):
     return issues
 
 
+def count_issues(jql_str):
+    """Return how many issues match `jql_str`.
+
+    On Jira Cloud the search goes through the enhanced (token-paginated)
+    API, whose `.total` is only the size of the returned page — not the
+    match count. So fetch every page (keys only) and count them.
+    """
+    return len(
+        _jira().enhanced_search_issues(jql_str, maxResults=False, fields="key")
+    )
+
+
 def add_comment(issue_key, comment):
     if os.getenv("DRY_RUN", "false").lower() == "true":
         print(f"[DRY RUN] Would comment on {issue_key} → {jira_issue_url(issue_key)}")

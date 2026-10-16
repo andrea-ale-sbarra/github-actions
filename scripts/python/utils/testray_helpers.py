@@ -17,6 +17,7 @@ from jira_helpers import (
     get_issue_status_by_key,
     get_issue_type_by_key,
     create_jira_task,
+    count_issues,
     get_all_issues,
     close_issue,
     close_orphan_subtasks_of_discarded,
@@ -321,7 +322,7 @@ def _format_routine_block(routine, task_id):
                 f"ORDER BY priority DESC"
             )
             url = f"https://liferay.atlassian.net/issues/?jql={quote_plus(jql)}"
-            lines.append(f"- {component}: {url}")
+            lines.append(f"- {component}{_format_ticket_count(jql)}: {url}")
     else:
         jql = (
             f'labels = "{routine_label}" '
@@ -329,10 +330,24 @@ def _format_routine_block(routine, task_id):
             f"ORDER BY priority DESC"
         )
         url = f"https://liferay.atlassian.net/issues/?jql={quote_plus(jql)}"
-        lines.append(f"Open Jira tickets: {url}")
+        lines.append(f"Open Jira tickets{_format_ticket_count(jql)}: {url}")
 
     lines.append("")
     return lines
+
+
+def _format_ticket_count(jql):
+    """Return ' (N)' for the recap, or '' if Jira can't be counted.
+
+    The count is a nice-to-have next to the link: a failed lookup must not
+    drop the link itself from the copy-paste block.
+    """
+    try:
+        count = count_issues(jql)
+    except Exception as e:
+        print(f"⚠ Could not count Jira tickets for recap ({e}).")
+        return ""
+    return f" ({count})"
 
 
 def _format_closure_report_lines(routine_runs, recent_build_window=20):
