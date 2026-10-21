@@ -21,6 +21,7 @@ from jira_helpers import (
     get_all_issues,
     close_issue,
     close_orphan_subtasks_of_discarded,
+    reopen_issue,
     CLOSE_OK,
     CLOSE_SKIPPED_PARENT_ACTIVE,
     CLOSE_SKIPPED_SFD_NO_SUBTASKS,
@@ -97,6 +98,11 @@ ANALYZED_ROUTINES = (
 # (consolidated into another subtask — carries 0 results). See
 # _finalize_task_completion for why MERGED must be treated as terminal.
 _TERMINAL_SUBTASK_STATUSES = frozenset({"COMPLETE", "MERGED"})
+
+
+# How far back a Discarded ticket is reopened instead of creating a new one
+# when its test fails again. See _find_recently_discarded_ticket_for_error.
+DISCARDED_REOPEN_WINDOW_DAYS = 30
 
 
 def select_routines():
@@ -1737,6 +1743,40 @@ def _find_existing_open_ticket_for_error(epic, case_names, errors):
     "Element is not present" ticket would look like the same error.
     Returns the existing issue key, or None.
     """
+    return _find_matching_routine_ticket(
+        epic, case_names, errors, "statusCategory != Done"
+    )
+
+
+def _find_recently_discarded_ticket_for_error(
+    epic, case_names, errors, days=DISCARDED_REOPEN_WINDOW_DAYS
+):
+    """
+    Same match as _find_existing_open_ticket_for_error, among the routine
+    tickets closed as Discarded in the last `days` days. The closure pass
+    discards a ticket as soon as its test passes once, so a flaky test that
+    fails again would otherwise get a new ticket every time. Tickets closed
+    as Completed are left alone: a failure after a fix may be a regression
+    and deserves its own ticket.
+    Returns the most recently resolved matching key, or None.
+    """
+    return _find_matching_routine_ticket(
+        epic,
+        case_names,
+        errors,
+        f"statusCategory = Done AND resolution = Discarded AND resolved >= -{days}d",
+        order_by="resolved DESC",
+    )
+
+
+def _find_matching_routine_ticket(
+    epic, case_names, errors, status_clause, order_by=None
+):
+    """
+    Return the first routine ticket matching `status_clause` whose
+    description lists one of `case_names`, or carries one of `errors` in a
+    {code} block, locator included. None if nothing matches.
+    """
     case_names = [name for name in case_names if name and name != "N/A"]
     new_errors = {_normalize_error_keep_locator(e) for e in errors if e}
     if not case_names and not new_errors:
@@ -1750,11 +1790,13 @@ def _find_existing_open_ticket_for_error(epic, case_names, errors):
 
     jql_parts = [
         f'labels = "{routine_label}"',
-        'statusCategory != Done',
+        status_clause,
     ]
     if epic is not None:
         jql_parts.append(f'parent = "{epic.key}"')
     jql = " AND ".join(jql_parts)
+    if order_by:
+        jql += f" ORDER BY {order_by}"
 
     try:
         candidates = get_all_issues(jql, fields=["description"])
@@ -2328,12 +2370,13 @@ def _create_investigation_task_for_subtask(
     )
     priority = _priority_for_days(max_days_failing)
 
+    case_names = [
+        get_case_info(f["case_id"]).get("name") for f in subtask_unique_failures
+    ]
+
     existing_key = _find_existing_open_ticket_for_error(
         epic,
-        [
-            get_case_info(f["case_id"]).get("name")
-            for f in subtask_unique_failures
-        ],
+        case_names,
         [f["error"] for f in subtask_unique_failures],
     )
     if existing_key:
@@ -2345,6 +2388,30 @@ def _create_investigation_task_for_subtask(
             existing_key, subtask_unique_failures, latest_build_id
         )
         return SimpleNamespace(key=existing_key)
+
+    discarded_key = _find_recently_discarded_ticket_for_error(
+        epic, case_names, [f["error"] for f in subtask_unique_failures]
+    )
+    if discarded_key:
+        reopened = reopen_issue(
+            discarded_key,
+            (
+                f"Reopened. Failing again in [Testray build {latest_build_id}|"
+                f"{testray_build_url(latest_build_id, _CURRENT_ROUTINE_ID)}] "
+                f"after being discarded as not reproducible: likely flaky."
+            ),
+            due_date=due_date_str,
+            label=label,
+        )
+        if reopened:
+            print(
+                f"♻ Reopened discarded ticket {discarded_key} for subtask "
+                f"{subtask_id} (matched on failing test or error with locator)"
+            )
+            _comment_new_tests_on_issues(
+                discarded_key, subtask_unique_failures, latest_build_id
+            )
+            return SimpleNamespace(key=discarded_key)
 
     issue = create_jira_task(
         epic=epic,

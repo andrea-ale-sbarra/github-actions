@@ -207,6 +207,59 @@ def close_issue(issue_key, build_hash):
         return CLOSE_FAILED
 
 
+def reopen_issue(issue_key, comment, due_date=None, label=None):
+    """
+    Reopen a Discarded routine ticket whose test is failing again, so a
+    flaky test keeps one ticket instead of getting a new one each time the
+    closure pass discards it.
+
+    Looks for a transition literally named 'Back to Open' first; falls back
+    to any transition that lands in the 'new' status category. Sub-tasks
+    closed with the parent stay closed: they belonged to the previous
+    investigation.
+
+    Returns True on success, False otherwise (the caller then creates a
+    new ticket).
+    """
+    try:
+        if os.getenv("DRY_RUN", "false").lower() == "true":
+            print(f"[DRY RUN] Would reopen Jira issue: {issue_key} → {jira_issue_url(issue_key)}")
+            return True
+
+        jira = _jira()
+        transitions = jira.transitions(issue_key)
+        reopen_transition = next(
+            (t for t in transitions if t.get("name") == "Back to Open"),
+            None,
+        ) or next(
+            (
+                t
+                for t in transitions
+                if t.get("to", {}).get("statusCategory", {}).get("key") == "new"
+            ),
+            None,
+        )
+
+        if not reopen_transition:
+            print(f"✘ No transition back to an open status found for {issue_key}")
+            return False
+
+        jira.transition_issue(issue_key, transition=reopen_transition["id"])
+
+        if due_date:
+            jira.issue(issue_key).update(fields={"duedate": due_date})
+        if label:
+            jira.issue(issue_key).update(update={"labels": [{"add": label}]})
+
+        jira.add_comment(issue_key, comment)
+        print(f"✔ {issue_key} → '{reopen_transition['name']}'")
+        return True
+
+    except Exception as e:
+        print(f"✘ Failed to reopen issue {issue_key}: {e}")
+        return False
+
+
 def create_jira_task(epic, summary, description, component, label, due_date=None, priority=None, routine_label=None):
     """
     Creates a Jira investigation task for unique failures.
