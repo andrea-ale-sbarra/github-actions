@@ -139,7 +139,9 @@ def analyze_testflow(builds, routine_id):
       4) apply updates and attempt task completion/cleanup
 
     Returns (task_id, closure_summary, cleanup_summary) where:
-      - task_id is None if no analysis happened
+      - task_id is None if no analysis happened, except when the latest
+        build's task is already COMPLETE: then its id is returned with no
+        summaries, so the recap still lists the routine's open tickets
       - closure_summary is None if no stale closure was attempted,
         otherwise a dict {build_id, build_hash, attempted, closed} from
         _close_stale_routine_tasks. The caller uses it to print the
@@ -156,10 +158,17 @@ def analyze_testflow(builds, routine_id):
         if not latest_build:
             return None, None, None
 
-        task_id, latest_build_id = _prepare_task(latest_build)
+        task_id, latest_build_id, complete_task_id = _prepare_task(latest_build)
 
         if not task_id and os.getenv("DRY_RUN", "false").lower() == "true":
             task_id, latest_build_id = _find_analyzable_build_for_dry_run(builds)
+
+        if not task_id and complete_task_id:
+            print(
+                f"ℹ No new build since task {complete_task_id} was completed. "
+                "Listing the open tickets in the recap only."
+            )
+            return complete_task_id, None, None
 
         if not task_id:
             print("✘ Could not find or create a valid task, exiting.")
@@ -779,7 +788,8 @@ def get_acceptance_build_id_for_current_sha(current_sha):
 def _prepare_task(latest_build):
     """
     Ensure a task exists for latest_build and is actionable.
-    Returns (task_id or None, latest_build_id).
+    Returns (task_id or None, latest_build_id, complete_task_id or None);
+    complete_task_id is set only when the build's task is already COMPLETE.
     """
     latest_build_id = latest_build["id"]
     build_to_tasks = get_build_tasks(latest_build_id)
@@ -790,20 +800,20 @@ def _prepare_task(latest_build):
                 f"[DRY RUN] No task exists for build '{latest_build['name']}'. "
                 "Skipping task/testflow creation and subsequent processing."
             )
-            return None, latest_build_id
+            return None, latest_build_id, None
         print(
             f"[CREATE] No tasks for build '{latest_build['name']}', creating task and testflow."
         )
         task = create_task(latest_build)
         create_testflow(task["id"])
         print(f"✔ Using build {latest_build_id} and task {task['id']}")
-        return task["id"], latest_build_id
+        return task["id"], latest_build_id, None
 
     for task in build_to_tasks:
         due_status_key = task.get("dueStatus", {}).get("key")
         if due_status_key == "ABANDONED":
             print(f"Task {task['id']} has been ABANDONED.")
-            return None, latest_build_id
+            return None, latest_build_id, None
 
         print(f"[USE] Using existing task {task['id']} with status {due_status_key}.")
         task_id = task["id"]
@@ -813,12 +823,12 @@ def _prepare_task(latest_build):
             print(
                 f"✔ Task {task_id} for build {latest_build_id} is now complete. No further processing required."
             )
-            return None, latest_build_id
+            return None, latest_build_id, task_id
 
         print(f"✔ Using build {latest_build_id} and task {task_id}")
-        return task_id, latest_build_id
+        return task_id, latest_build_id, None
 
-    return None, latest_build_id
+    return None, latest_build_id, None
 
 
 def _find_analyzable_build_for_dry_run(builds):
