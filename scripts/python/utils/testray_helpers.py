@@ -3,6 +3,7 @@ import os
 
 sys.path.append(os.path.dirname(__file__))
 
+import json
 import re
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta
@@ -1153,6 +1154,7 @@ def _scan_unique_failures(subtask_id, results):
 
         # First result can short-circuit the subtask
         if first_result and _should_skip_result(error):
+            _log_skipped_result(r, error)
             update_subtask_status(subtask_id)
             first_result_skipped = True
             first_result = False
@@ -1161,7 +1163,10 @@ def _scan_unique_failures(subtask_id, results):
         first_result = False
 
         # Already handled or globally skippable
-        if r.get("issues") or _should_skip_result(error):
+        if r.get("issues"):
+            continue
+        if _should_skip_result(error):
+            _log_skipped_result(r, error)
             continue
 
         # Consider as unique failure (unhandled)
@@ -1640,6 +1645,32 @@ def _build_rca_block(batch_name, test_selector, github_compare):
     )
 
 
+def _log_skipped_result(result, error):
+    """Print a skipped result's error and its full Liferay log link.
+
+    Skipped results never get a ticket, and PortalLogAssertorTest collects
+    exceptions thrown anywhere in the batch, so a Commerce regression can
+    surface only here (the Country NPE behind LPD-111082 did). Testray keeps
+    just the first ~170 characters of the error; the full log sits behind a
+    Google login, so the link is printed for a manual look.
+    """
+    flag = "⚠ COMMERCE " if "commerce" in error.lower() else ""
+    print(
+        f"{flag}Skipped result {result['id']}: {' '.join(error.split())[:300]}"
+    )
+
+    try:
+        attachments = json.loads(result.get("attachments") or "[]")
+    except ValueError:
+        attachments = []
+    log_url = next(
+        (a.get("url") for a in attachments if a.get("name") == "Liferay Log"),
+        None,
+    )
+    if log_url:
+        print(f"    Liferay Log: {log_url}")
+
+
 def _should_skip_result(error):
     if "AssertionError" in error:
         return False
@@ -1647,7 +1678,6 @@ def _should_skip_result(error):
     skip_error_keywords = [
         "Failed prior to running test",
         "PortalLogAssertorTest#testScanXMLLog",
-        "Skipped test",
         "The build failed prior to running the test",
         "test-portal-testsuite-upstream-downstream(master) timed out after",
         "Unable to run test on CI",
@@ -2329,6 +2359,10 @@ def _create_investigation_task_for_subtask(
         jira_components = [
             {
                 "API Builder": "API Builder",
+                # Harness rows (a Playwright shard, the whole batch) carry no
+                # product component, and LPD rejects a ticket without a valid
+                # one, leaving the subtask OPEN and the task never complete.
+                "Batch": "Product Information Management",
                 "Commerce": "Product Information Management",
                 "Connectors": "Data Integration > Connectors",
                 "Data Migration Center": "Data Integration > Data Migration Center",
@@ -2339,6 +2373,7 @@ def _create_investigation_task_for_subtask(
                 "Object": "Objects > Object Entries REST APIs",
                 "Object Entries REST APIs": "Objects > Object Entries REST APIs",
                 "Order Management": "Order Management",
+                "Playwright": "Product Information Management",
                 "Product Info Management": "Product Information Management",
                 "REST Builder": "REST Builder",
                 "REST Infrastructure": "REST Infrastructure",
