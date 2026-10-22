@@ -78,6 +78,9 @@ ANALYZED_ROUTINES = (
         # Tickets flagged by the developer (cover image on the Jira board)
         # to be cross-checked against Acceptance after the PR is merged.
         "check_label": "commerce_check_failures",
+        # Skipped PortalLogAssertorTest errors mentioning one of these are
+        # listed in the recap (see _log_skipped_result).
+        "log_scan_keywords": ("commerce",),
     },
     {
         "id": USER_MANAGEMENT_ROUTINE_ID,
@@ -90,6 +93,13 @@ ANALYZED_ROUTINES = (
         "routine_label": "um_routine_tasks",
         "out_rc_label": "um_out_rc",
         "check_label": "um_check_failures",
+        "log_scan_keywords": (
+            "account",
+            "model.user",
+            "organization",
+            "role",
+            "usergroup",
+        ),
     },
 )
 
@@ -104,6 +114,11 @@ _TERMINAL_SUBTASK_STATUSES = frozenset({"COMPLETE", "MERGED"})
 # How far back a Discarded ticket is reopened instead of creating a new one
 # when its test fails again. See _find_recently_discarded_ticket_for_error.
 DISCARDED_REOPEN_WINDOW_DAYS = 30
+
+
+# Skipped results whose error matches the routine's log_scan_keywords, by
+# routine id, filled by _log_skipped_result and listed in the recap.
+_FLAGGED_SKIPPED_RESULTS = defaultdict(list)
 
 
 def select_routines():
@@ -280,6 +295,7 @@ def print_slack_summary(
     section3b = _format_cleanup_report_lines(routine_runs)
     section3c = _format_sfd_skipped_report_lines(routine_runs)
     section3d = _format_blocking_subtasks_report_lines(routine_runs)
+    section3e = _format_flagged_log_errors_lines(active_runs)
 
     section4 = []
     pr_blocks = []
@@ -304,6 +320,7 @@ def print_slack_summary(
         *section3b,
         *section3c,
         *section3d,
+        *section3e,
         *section4,
         *(extra_tail_lines or []),
     ]
@@ -504,6 +521,42 @@ def _format_sfd_skipped_report_lines(routine_runs):
             lines.append(f"  - {key}  {jira_issue_url(key)}")
         lines.append("")
     return lines
+
+
+def _format_flagged_log_errors_lines(routine_runs):
+    """Return the lines listing the skipped portal-log errors that mention
+    the routine's area (empty if none).
+
+    These never get a ticket, so the recap is the only place a human sees
+    them. Identical errors are listed once, with how many results had them.
+    """
+    lines = []
+    for entry in routine_runs:
+        routine = entry[0]
+        by_error = {}
+        for item in _FLAGGED_SKIPPED_RESULTS.get(routine["id"], []):
+            first, count = by_error.get(item["error"], (item, 0))
+            by_error[item["error"]] = (first, count + 1)
+        if not by_error:
+            continue
+
+        lines.append(f"{routine['name']} ({len(by_error)}):")
+        for error, (item, count) in by_error.items():
+            times = f" (x{count})" if count > 1 else ""
+            lines.append(f"- {error[:200]}{times}")
+            if item["log_url"]:
+                lines.append(f"  Liferay Log: {item['log_url']}")
+        lines.append("")
+
+    if not lines:
+        return []
+
+    return [
+        "Errors in the portal log with no ticket (PortalLogAssertorTest, "
+        "check by hand):",
+        "",
+        *lines,
+    ]
 
 
 def _format_blocking_subtasks_report_lines(routine_runs):
@@ -1652,12 +1705,17 @@ def _log_skipped_result(result, error):
     exceptions thrown anywhere in the batch, so a Commerce regression can
     surface only here (the Country NPE behind LPD-111082 did). Testray keeps
     just the first ~170 characters of the error; the full log sits behind a
-    Google login, so the link is printed for a manual look.
+    Google login, so the link is printed for a manual look. Errors matching
+    the routine's log_scan_keywords are also kept for the recap.
     """
-    flag = "⚠ COMMERCE " if "commerce" in error.lower() else ""
-    print(
-        f"{flag}Skipped result {result['id']}: {' '.join(error.split())[:300]}"
+    routine = _get_routine_config(_CURRENT_ROUTINE_ID) or {}
+    error_line = " ".join(error.split())
+    flagged = any(
+        keyword in error_line.lower()
+        for keyword in routine.get("log_scan_keywords", ())
     )
+    flag = f"⚠ {routine['name'].upper()} " if flagged else ""
+    print(f"{flag}Skipped result {result['id']}: {error_line[:300]}")
 
     try:
         attachments = json.loads(result.get("attachments") or "[]")
@@ -1669,6 +1727,11 @@ def _log_skipped_result(result, error):
     )
     if log_url:
         print(f"    Liferay Log: {log_url}")
+
+    if flagged:
+        _FLAGGED_SKIPPED_RESULTS[routine["id"]].append(
+            {"error": error_line, "log_url": log_url}
+        )
 
 
 def _should_skip_result(error):
