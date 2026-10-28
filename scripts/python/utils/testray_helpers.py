@@ -954,10 +954,31 @@ def _normalize_error_keep_locator(error):
         return ""
 
     error = " ".join(error.strip().split())
+    error = _strip_playwright_error_noise(error)
     error = re.sub(r"\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}", "", error)
     error = re.sub(r"0x[0-9A-Fa-f]+", "", error)
     error = re.sub(r"\d+\s*(ms|s|seconds|minutes|m)\b", "", error)
     error = re.sub(r"\d{4,}", "#", error)
+
+    return error
+
+
+def _strip_playwright_error_noise(error):
+    """Reduce a Playwright error to its message.
+
+    Playwright errors start with "› spec.ts:line:col › test title" and end
+    with stack frames, and Testray cuts the whole string at a fixed length,
+    so the same failure in two tests never compares equal. Keep only the
+    text from "Error:" to the first frame, with the CI host masked
+    (e.g. "http://i-04d2ea3ad284d60a5:8080" differs on every run).
+    """
+    if not error.startswith("›") or "Error:" not in error:
+        return error
+
+    error = error[error.index("Error:"):]
+    error = re.sub(r" at (\.\./|/).*$", "", error)
+    error = re.sub(r" at \.{0,2}$", "", error)
+    error = re.sub(r"https?://[^/\s]+", "http://#", error)
 
     return error
 
