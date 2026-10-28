@@ -1035,6 +1035,7 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
     so a crash mid-loop doesn't force a full restart on the next run.
     """
     subtasks = get_task_subtasks(task_id)
+    hosts_with_failing_tests = _hosts_with_failing_tests(latest_build_id)
 
     for subtask in subtasks:
         subtask_id = subtask["id"]
@@ -1055,7 +1056,7 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
 
         # 2) Scan current results for unique failures (skip known errors)
         unique_failures, first_result_skipped = _scan_unique_failures(
-            subtask_id, results
+            subtask_id, results, hosts_with_failing_tests
         )
 
         # Group failures by normalized error so each group can map to its own issue(s)
@@ -1214,10 +1215,47 @@ def _backfill_subtask_issues_if_needed(subtask_id, subtask, results):
         update_subtask_status(subtask_id, issues=_join_issues(issues))
 
 
-def _scan_unique_failures(subtask_id, results):
+_PLAYWRIGHT_SHARD_HOST_RE = re.compile(
+    r"Stopping container \[ID: '\w+', name: '(i-[0-9a-f]+)_playwright'\]"
+)
+_CI_HOST_RE = re.compile(r"\bi-[0-9a-f]{8,}\b")
+
+
+def _playwright_shard_host(error):
+    """Return the CI host of a Playwright shard row, or None.
+
+    A shard row (e.g. "playwright-js-tomcat101-postgresql163/10/0") fails
+    whenever one of its tests fails, and its error is only the tail of the
+    shard's console: "[exec] 54 passed (21.4m) [exec] Stopping container
+    [ID: '...', name: 'i-0434569b5f6be2037_playwright']".
+    """
+    match = _PLAYWRIGHT_SHARD_HOST_RE.search(error or "")
+    return match.group(1) if match else None
+
+
+def _hosts_with_failing_tests(build_id):
+    """Return the CI hosts named in the errors of the build's failing tests.
+
+    Tests that call an API carry their host in the request URL, so a shard
+    whose host shows up here has its failure tracked on a test row already.
+    """
+    hosts = set()
+    for r in get_all_build_case_results(build_id):
+        error = r.get("errors") or ""
+        if error and not _playwright_shard_host(error):
+            hosts.update(_CI_HOST_RE.findall(error))
+    return hosts
+
+
+def _scan_unique_failures(subtask_id, results, hosts_with_failing_tests=frozenset()):
     """
     Return (unique_failures:list[dict], first_result_skipped:bool).
     We short-circuit the subtask if the first result matches a global skip.
+
+    A Playwright shard row is skipped when one of the build's failing tests
+    ran on the same host: the test row gets the ticket. A shard with no such
+    test (a crash, a whole-shard timeout, or tests whose error names no
+    host) still gets one, since its row may be the only trace.
     """
     unique_failures = []
     first_result = True
@@ -1240,6 +1278,9 @@ def _scan_unique_failures(subtask_id, results):
         if r.get("issues"):
             continue
         if _should_skip_result(error):
+            _log_skipped_result(r, error)
+            continue
+        if _playwright_shard_host(error) in hosts_with_failing_tests:
             _log_skipped_result(r, error)
             continue
 
