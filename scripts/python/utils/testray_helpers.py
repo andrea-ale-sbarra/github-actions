@@ -1993,7 +1993,9 @@ def _report_poshi_tests_decrease(start_of_quarter_count, current_count):
 
 @lru_cache()
 def _load_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
+    # Pin to CPU: auto-detection calls torch.cuda.is_available(), which hangs
+    # forever when the local NVIDIA driver is wedged.
+    return SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
 
 
 def _are_errors_similar(current_norm, history_norm, threshold=0.8):
