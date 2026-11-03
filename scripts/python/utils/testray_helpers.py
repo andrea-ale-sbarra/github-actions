@@ -1035,7 +1035,7 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
     so a crash mid-loop doesn't force a full restart on the next run.
     """
     subtasks = get_task_subtasks(task_id)
-    hosts_with_failing_tests = _hosts_with_failing_tests(latest_build_id)
+    failing_test_errors = _failing_test_errors(latest_build_id)
 
     for subtask in subtasks:
         subtask_id = subtask["id"]
@@ -1056,7 +1056,7 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
 
         # 2) Scan current results for unique failures (skip known errors)
         unique_failures, first_result_skipped = _scan_unique_failures(
-            subtask_id, results, hosts_with_failing_tests
+            subtask_id, results, failing_test_errors
         )
 
         # Group failures by normalized error so each group can map to its own issue(s)
@@ -1233,27 +1233,64 @@ def _playwright_shard_host(error):
     return match.group(1) if match else None
 
 
-def _hosts_with_failing_tests(build_id):
-    """Return the CI hosts named in the errors of the build's failing tests.
+def _playwright_shard_summary(error):
+    """Return the test error a Playwright shard row repeats, or None.
 
-    Tests that call an API carry their host in the request URL, so a shard
-    whose host shows up here has its failure tracked on a test row already.
+    When one of its tests times out, a shard row carries no console tail
+    but only that test's error behind a prefix: "Playwright Test timeout
+    of 90000ms exceeded." Test rows start with "› spec.ts:line:col".
     """
-    hosts = set()
+    error = (error or "").strip()
+    if error.startswith("Playwright "):
+        return error[len("Playwright "):]
+    return None
+
+
+def _failing_test_errors(build_id):
+    """Return the errors of the build's failing tests, shard rows excluded."""
+    errors = []
     for r in get_all_build_case_results(build_id):
         error = r.get("errors") or ""
-        if error and not _playwright_shard_host(error):
-            hosts.update(_CI_HOST_RE.findall(error))
-    return hosts
+        if (
+            error
+            and not _playwright_shard_host(error)
+            and not _playwright_shard_summary(error)
+        ):
+            errors.append(error)
+    return errors
 
 
-def _scan_unique_failures(subtask_id, results, hosts_with_failing_tests=frozenset()):
+def _is_tracked_playwright_shard(error, failing_test_errors):
+    """Return True when a test row of the build already carries the
+    failure of this Playwright shard row.
+
+    Tests that call an API carry their host in the request URL, so a shard
+    whose host shows up there is tracked on a test row. A shard whose row
+    repeats a test error is tracked on the test row that has that error.
+    """
+    # Still open: a console-tail shard row ("[exec] 17 passed (13.1m)
+    # [exec] Stopping container ...") whose host appears in no test error,
+    # because its failing tests call no API. A dry run on builds 550991789
+    # and 555468323 (2026-11-03) left about ten such rows opening tickets.
+    # Do not skip them blindly: a crashed shard leaves the same row as the
+    # only trace. Add a rule only when one of those tickets, investigated,
+    # turns out to repeat a failure already tracked on a test row, and take
+    # the shard-to-test link from that case (e.g. the spec files the shard
+    # ran, if Testray exposes them), not from the error text alone.
+    host = _playwright_shard_host(error)
+    if host:
+        return any(host in _CI_HOST_RE.findall(e) for e in failing_test_errors)
+    summary = _playwright_shard_summary(error)
+    return bool(summary) and any(summary in e for e in failing_test_errors)
+
+
+def _scan_unique_failures(subtask_id, results, failing_test_errors=()):
     """
     Return (unique_failures:list[dict], first_result_skipped:bool).
     We short-circuit the subtask if the first result matches a global skip.
 
     A Playwright shard row is skipped when one of the build's failing tests
-    ran on the same host: the test row gets the ticket. A shard with no such
+    carries its failure: the test row gets the ticket. A shard with no such
     test (a crash, a whole-shard timeout, or tests whose error names no
     host) still gets one, since its row may be the only trace.
     """
@@ -1280,7 +1317,7 @@ def _scan_unique_failures(subtask_id, results, hosts_with_failing_tests=frozense
         if _should_skip_result(error):
             _log_skipped_result(r, error)
             continue
-        if _playwright_shard_host(error) in hosts_with_failing_tests:
+        if _is_tracked_playwright_shard(error, failing_test_errors):
             _log_skipped_result(r, error)
             continue
 
