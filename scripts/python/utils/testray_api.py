@@ -249,97 +249,54 @@ def get_routine_info(routine_id):
     return _get_json(url)
 
 
-def find_cases_by_name_substring(name_substring, limit=20):
-    """Return Testray cases whose `name` contains `name_substring`.
+def find_build_case_results_by_case_name(build_id, name_substring):
+    """Return every case result of `build_id` whose case name contains
+    `name_substring`, as a list of {"case_name", "status", "id"}.
 
-    Used by the PR review check to map a Java test class name (taken
-    from a merge diff) to the Testray case(s) that exercise it, without
-    paginating through every case result of a build. `limit` caps the
-    response in the rare event that several packages contain a class
-    with the same simple name.
+    Two steps, both server-side filtered: the cases whose name contains
+    the substring (paginated), then their case results in the build. The
+    case ids go in chunks because a Poshi file can have hundreds of case
+    ids (one per test, plus stale duplicates) and a single `in (...)`
+    filter overflows the URL (HTTP 414).
     """
     from urllib.parse import quote_plus
 
-    encoded = quote_plus(f"contains(name,'{name_substring}')")
-    url = (
-        f"{BASE_URL}/cases?filter={encoded}"
-        f"&fields=id,name&pageSize={limit}"
-    )
-    return _get_json(url).get("items", []) or []
-
-
-def find_case_by_exact_name(name):
-    """Look up the case whose `name` equals `name` exactly. Returns one
-    case dict ({id, name}) or None.
-
-    Faster and more accurate than the substring matcher when the caller
-    already has the Java FQN of the test (derived from the file path).
-    """
-    from urllib.parse import quote
-
-    encoded = quote(f"name eq '{name}'")
-    url = f"{BASE_URL}/cases?filter={encoded}&fields=id,name&pageSize=2"
-    items = _get_json(url).get("items", []) or []
-    for item in items:
-        if item.get("name") == name:
-            return item
-    return None
-
-
-def find_case_result_in_build_via_history(build_id, case_id, routine_id=ACCEPTANCE_ROUTINE_ID):
-    """Find the case result for `case_id` within `build_id`.
-
-    Walks the testray-rest `case-result-history` endpoint for the case,
-    filtered server-side to the given routine and (when honored)
-    to the specific build. The endpoint is already used elsewhere in
-    this script for AFT history and is the reliable way to navigate
-    from (case, build) to a specific case-result row.
-
-    `routine_id` defaults to Acceptance for callers that already only
-    care about Acceptance; the PR review check passes the routine the
-    build actually belongs to (e.g. Commerce 35394) so the server-side
-    filter doesn't silently drop the row.
-
-    Returns a dict shaped as:
-        {"id": <case_result_id>, "dueStatus": {"name": "<STATUS>"}}
-    or None when the case did not run in this build.
-    """
-    expected_build = int(build_id)
-    base_url = f"{TESTRAY_REST_URL}/testray-case-result-history/{case_id}"
-
+    escaped = name_substring.replace("'", "''")
+    case_filter = quote_plus(f"contains(name,'{escaped}')")
+    case_names = {}
     page = 1
-    page_size = 500
     while True:
-        params = (
-            f"testrayRoutineIds={routine_id}"
-            f"&testrayBuildIds={expected_build}"
-            f"&page={page}&pageSize={page_size}"
+        data = _get_json(
+            f"{BASE_URL}/cases?filter={case_filter}"
+            f"&fields=id,name&pageSize=500&page={page}"
         )
-        url = f"{base_url}?{params}"
-        result = _get_json(url) or {}
-        items = result.get("items", []) or []
-
-        for entry in items:
-            # Defensive: even if `testrayBuildIds` isn't honored
-            # server-side, only accept the entry that's actually for
-            # the build we asked about.
-            if int(entry.get("testrayBuildId") or 0) != expected_build:
-                continue
-            cr_id = (
-                entry.get("testrayCaseResultId")
-                or entry.get("caseResultId")
-                or entry.get("id")
-            )
-            return {
-                "id": cr_id,
-                "dueStatus": {"name": entry.get("status")},
-            }
-
-        if len(items) < page_size:
+        items = data.get("items", []) or []
+        for c in items:
+            if c.get("id") and c.get("name"):
+                case_names[c["id"]] = c["name"]
+        if len(items) < 500:
             break
         page += 1
 
-    return None
+    results = []
+    case_ids = list(case_names)
+    for i in range(0, len(case_ids), 100):
+        ids = ",".join(f"'{cid}'" for cid in case_ids[i:i + 100])
+        result_filter = quote_plus(
+            f"r_buildToCaseResult_c_buildId eq '{build_id}' "
+            f"and r_caseToCaseResult_c_caseId in ({ids})"
+        )
+        data = _get_json(
+            f"{BASE_URL}/caseresults?filter={result_filter}"
+            f"&fields=id,dueStatus,r_caseToCaseResult_c_caseId&pageSize=500"
+        )
+        for cr in data.get("items", []) or []:
+            results.append({
+                "case_name": case_names.get(cr.get("r_caseToCaseResult_c_caseId"), ""),
+                "status": ((cr.get("dueStatus") or {}).get("name") or "UNTESTED").upper(),
+                "id": cr.get("id"),
+            })
+    return results
 
 
 def get_build_tasks(build_id):

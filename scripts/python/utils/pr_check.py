@@ -27,9 +27,9 @@ For every Jira ticket carrying the routine's `check_label` (`commerce_check_fail
          build): try Acceptance first, fall back to the ticket's
          routine. Picks the latest matching build — the freshest
          verdict.
-  4. Matches the test files in the diff against the case names that ran
-     in that build and reports each one's status (PASSED / FAILED /
-     BLOCKED / NOT FOUND).
+  4. For every test file in the diff, reports the status of ALL its
+     tests that ran in that build (PASSED / FAILED / BLOCKED / ...), or
+     NOT RUN when none of them did.
 
 The output is purely read-only and Slack-ready. Used both by the main run
 (`analyze_testray_results.py`) and the standalone command
@@ -48,9 +48,7 @@ sys.path.append(os.path.dirname(__file__))
 
 from jira_helpers import get_all_issues, jira_issue_url
 from testray_api import (
-    find_case_by_exact_name,
-    find_case_result_in_build_via_history,
-    find_cases_by_name_substring,
+    find_build_case_results_by_case_name,
     get_routine_to_builds,
     testray_build_url,
     testray_case_result_url,
@@ -99,13 +97,16 @@ _COMPARE_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Heuristics that pick test files out of the merge diff. Covers:
-#   • Java integration / unit:   *Test.java, *IT.java, or any file under
-#                                /src/test/ or /src/testIntegration/
+# Test files in the merge diff. Any change to one of these puts ALL of its
+# tests in the check, whatever the change was (new test, edited test,
+# renamed title): the reader opens the build and finds the test they
+# care about, so we don't try to work out which test the diff touched.
+#   • Java integration / unit:   *Test.java, *IT.java
 #   • Playwright / Jest / Vitest: *.spec.{ts,tsx,js,jsx,mjs},
-#                                 *.test.{ts,tsx,js,jsx,mjs},
-#                                 or any file under /playwright/ /e2e/ /tests/
+#                                 *.test.{ts,tsx,js,jsx,mjs}
 #   • Poshi (Liferay):           *.testcase
+# Helpers next to the tests (fixtures, page objects, *TestUtil.java) are
+# not test files: they have no case of their own in Testray.
 _TEST_FILENAME_RE = re.compile(
     r"(?:"
     r"(?:Test|IT)\.java"          # Java integration/unit
@@ -113,41 +114,17 @@ _TEST_FILENAME_RE = re.compile(
     r"|\.testcase"                # Poshi
     r")$"
 )
-_TEST_PATH_HINTS = (
-    "/src/test/", "/src/testIntegration/", "/test/integration/",
-    "/playwright/", "/e2e/", "/tests/e2e/",
-)
 
-# Extensions stripped from a non-Java test filename to build the Testray
-# case-name substring. Order matters: longest first so
-# `productEditor.spec.ts` loses only `.ts` and the remaining
-# `productEditor.spec` is what we query.
-_STRIPPABLE_EXTENSIONS = (
-    ".java", ".testcase", ".tsx", ".ts", ".jsx", ".js", ".mjs",
-)
-
-# Java tests under the Maven/Gradle layout: capture the dotted FQN out
-# of the path so we can ask Testray for an *exact* case-name match.
+# Java tests under the Maven/Gradle layout: the dotted FQN is the
+# Testray case name.
 _JAVA_FQN_PATH_RE = re.compile(
     r"/src/(?:test|testIntegration|main)/java/(.+)\.java$"
 )
 
-# Playwright / Jest / Vitest spec files. For these we don't want to match
-# every test in the file — we want only the test() / it() / describe()
-# blocks referenced in the diff, because Testray names each case after
-# the test description (e.g. "productDetails.spec.ts > LPD-39598 ...").
-_JS_TEST_FILENAME_RE = re.compile(
-    r"\.(?:spec|test)\.(?:ts|tsx|js|jsx|mjs)$"
-)
-
-# test('name', …) / it('name', …) / test.describe('name', …) / it.each(…)
-# with single, double, or back-tick quotes. Captures the description so
-# the caller can use it as the Testray case-name substring.
-_JS_TEST_BLOCK_RE = re.compile(
-    r"""\b(?:test|it)(?:\.[A-Za-z_][A-Za-z_0-9]*)?\s*\(\s*"""
-    r"""(['"`])(.+?)\1""",
-    re.DOTALL,
-)
+# Playwright case names start with the spec path relative to this
+# folder, e.g. "commerce/commerce-product-definitions-web/main/
+# commerceAdminProducts.spec.ts > <test title>".
+_PLAYWRIGHT_TESTS_DIR = "/playwright/tests/"
 
 
 # ---------------------------------------------------------------------------
@@ -270,18 +247,23 @@ def format_pr_check_block(routine, results):
             meta_parts.append(f"{routine_name} build {build_id}: {build_url}")
         lines.append(ticket_line + " - " + " | ".join(meta_parts))
 
+        # One line per test file with its counts, then the tests that
+        # did not pass. The passed ones are in the build link above.
+        by_file = {}
         for tr in r["test_results"]:
-            status = tr["status"]
-            label = f"[{status}]"
-            if tr.get("caseresult_url"):
-                lines.append(
-                    f"    {label} {tr['case_name']} ({tr['caseresult_url']})"
-                )
-            else:
-                lines.append(f"    {label} {tr['case_name']}")
-
-        if not r["test_results"]:
-            lines.append("    (no matching test cases found in the build)")
+            by_file.setdefault(tr["test_file"], []).append(tr)
+        for test_file, rows in by_file.items():
+            lines.append(f"    {test_file}: {_format_status_counts(rows)}")
+            for tr in rows:
+                if tr["case_name"] is None or tr["status"] == "PASSED":
+                    continue
+                label = f"[{tr['status']}]"
+                if tr.get("caseresult_url"):
+                    lines.append(
+                        f"        {label} {tr['case_name']} ({tr['caseresult_url']})"
+                    )
+                else:
+                    lines.append(f"        {label} {tr['case_name']}")
 
     lines.append("")
     return lines
@@ -359,7 +341,8 @@ def _check_ticket(issue, builds_by_routine, routine_lookup_order, prefer_latest)
             "routine_id": int | None,    # routine the matched build lives in
             "routine_name": str | None,
             "test_results": [
-                {"case_name": str, "status": str, "caseresult_url": str | None}
+                {"test_file": str, "case_name": str | None, "status": str,
+                 "caseresult_url": str | None}
             ],
         }
     """
@@ -413,13 +396,13 @@ def _check_ticket(issue, builds_by_routine, routine_lookup_order, prefer_latest)
             flush=True,
         )
 
-    test_search_names = _derive_test_search_names(cmp_info.get("files") or [])
+    test_files = _derive_test_files(cmp_info.get("files") or [])
     print(
         f"    · {len(cmp_info.get('files') or [])} file(s) in diff, "
-        f"{len(test_search_names)} test file(s) detected",
+        f"{len(test_files)} test file(s) detected",
         flush=True,
     )
-    if not test_search_names:
+    if not test_files:
         base["skip_reason"] = "no_test_files"
         return base
 
@@ -468,7 +451,7 @@ def _check_ticket(issue, builds_by_routine, routine_lookup_order, prefer_latest)
         flush=True,
     )
     base["test_results"] = _collect_test_results(
-        build_id, test_search_names, routine_id
+        build_id, test_files, routine_id
     )
     base["status"] = "checked"
     base["skip_reason"] = None
@@ -544,99 +527,45 @@ def _adf_to_text(node):
     return " ".join(p for p in parts if p)
 
 
-def _derive_test_search_names(changed_files):
-    """Return the set of `(name, is_exact)` pairs to look up in Testray.
+def _derive_test_files(changed_files):
+    """Return `{display_name: case_name_key}` for the test files in the diff.
 
-    The rule depends on framework:
+    `case_name_key` is the piece every Testray case of that file has in
+    its name, so a "contains" search returns all of the file's tests:
 
-      • Java tests in Maven/Gradle layout (`/src/test/java/...` or
-        `/src/testIntegration/java/...`) yield the dotted FQN with
-        `is_exact=True`. Testray names these cases by the FQN, so we
-        can match exactly without ambiguity.
-      • Playwright / Jest / Vitest spec files yield ONE entry per
-        `test()` / `it()` / `describe()` block referenced in the patch
-        (added, removed, or context). Testray names these cases as
-        `<spec_path> > <test description>`, so searching by the test
-        description finds the specific case in the diff instead of
-        every test that happens to live in the same spec file. Spec
-        files whose patch surfaces no `test()` block are skipped — we
-        intentionally avoid the broader filename-stem fallback so the
-        report stays scoped to the PR's actual diff.
-      • Anything else (Poshi `.testcase`, etc.) yields the filename
-        stem (extension stripped) with `is_exact=False`.
+      • Java: the dotted FQN ("com.liferay....ShipmentResourceTest").
+      • Poshi: "LocalFile.<Name>#" ("LocalFile.CommerceSmoke#Publish...").
+      • Playwright: the spec path under `playwright/tests/`.
+      • Other JS test files: the file name.
     """
-    names = set()
+    files = {}
     for f in changed_files:
         filename = (f.get("filename") or "").strip()
-        if not filename:
+        if not filename or not _TEST_FILENAME_RE.search(filename):
             continue
-
-        looks_like_test = bool(_TEST_FILENAME_RE.search(filename)) or any(
-            hint in filename for hint in _TEST_PATH_HINTS
-        )
-        if not looks_like_test:
-            continue
+        base = filename.rsplit("/", 1)[-1]
 
         fqn_match = _JAVA_FQN_PATH_RE.search(filename)
         if fqn_match:
             fqn = fqn_match.group(1).replace("/", ".")
-            names.add((fqn, True))
-            continue
-
-        if _JS_TEST_FILENAME_RE.search(filename):
-            for desc in _extract_js_test_descriptions(f.get("patch") or ""):
-                names.add((desc, False))
-            continue
-
-        base = filename.rsplit("/", 1)[-1]
-        for ext in _STRIPPABLE_EXTENSIONS:
-            if base.endswith(ext):
-                base = base[: -len(ext)]
-                break
-        if base:
-            names.add((base, False))
-    return names
-
-
-def _extract_js_test_descriptions(patch_text):
-    """Return the set of `test()` / `it()` descriptions present in the patch.
-
-    We look at:
-      - every patch line whose first character is `+`, `-`, or a space
-        (i.e. added, removed, and context lines), skipping the file
-        headers `+++ b/...` and `--- a/...`;
-      - hunk header lines `@@ … @@ <context>`, because GitHub records
-        the enclosing function declaration there and a body-only edit
-        may surface its `test('…', () => {` only through that header.
-
-    Mentioning the description on any side of the diff is enough.
-
-    Returns descriptions verbatim. The caller does a substring match in
-    Testray, so we don't need to compose the full `<path> > <desc>` name.
-    """
-    if not patch_text:
-        return set()
-
-    descriptions = set()
-    for line in patch_text.split("\n"):
-        if not line:
-            continue
-        if line.startswith("+++") or line.startswith("---"):
-            continue
-        if line.startswith("@@"):
-            # Hunk header: strip the `@@ -a,b +c,d @@` prefix, scan the rest.
-            tail = re.split(r"@@\s?", line, maxsplit=2)
-            body = tail[-1] if tail else ""
+            files[fqn] = fqn
+        elif base.endswith(".testcase"):
+            files[base] = f"LocalFile.{base[:-len('.testcase')]}#"
+        elif _PLAYWRIGHT_TESTS_DIR in filename:
+            spec = filename.split(_PLAYWRIGHT_TESTS_DIR, 1)[1]
+            files[spec] = spec
         else:
-            prefix = line[0]
-            if prefix not in ("+", "-", " "):
-                continue
-            body = line[1:]
-        for match in _JS_TEST_BLOCK_RE.finditer(body):
-            desc = (match.group(2) or "").strip()
-            if desc:
-                descriptions.add(desc)
-    return descriptions
+            files[base] = base
+    return files
+
+
+def _matches_key(case_name, key):
+    """True when `case_name` belongs to the file `key` and not to a
+    longer name that merely contains it (FooTest vs FooTestCase)."""
+    if not case_name.startswith(key):
+        return False
+    rest = case_name[len(key):]
+    return not rest or key.endswith("#") or not (rest[0].isalnum() or rest[0] == "_")
 
 
 def _find_build_containing(
@@ -730,97 +659,45 @@ def _find_build_containing(
     return None
 
 
-def _collect_test_results(build_id, test_search_names, routine_id):
-    """Resolve each `(name, is_exact)` pair to a Testray case-result.
+def _collect_test_results(build_id, test_files, routine_id):
+    """Return one row per test of each changed test file that ran in
+    `build_id`, plus a NOT RUN row for a file with no test in the build
+    (deleted file, test not part of this routine, case not yet created).
 
-    Two lookups per name:
-
-      1. Find the Testray case. Exact-name match first (the natural fit
-         for Java FQNs derived from the diff); fall back to substring
-         only when no exact case is found.
-      2. Walk the case's history in this build via the testray-rest
-         `case-result-history` endpoint to get the case-result row + its
-         id and status.
-
-    Dedupes by `case_name` because Testray may carry several `case_id`s
-    with the same name (one per method, or stale entries); the report
-    keeps one row per unique name and the click-through link drills into
-    the case-result entity directly.
-
-    Surfaces NOT FOUND rows for tests we couldn't map to any Testray
-    case, so silence in the report isn't read as green-by-default.
+    Row shape: {"test_file", "case_name", "status", "caseresult_url"}.
+    One row per case name: a case that ran more than once keeps the
+    worst status, so a FAILED retry is never hidden by a PASSED one.
     """
-    if not test_search_names:
-        return []
-
-    out_by_name = {}    # case_name → row dict
-    matched_inputs = set()
-
-    for name, is_exact in sorted(test_search_names):
-        print(
-            f"    · resolving Testray case for '{name}' (exact={is_exact})...",
-            flush=True,
-        )
-        cases = []
-        if is_exact:
-            case = find_case_by_exact_name(name)
-            if case:
-                cases = [case]
-        if not cases:
-            # No exact hit (or non-Java input): fall back to substring on
-            # the simple class name / file stem.
-            substring = name.rsplit(".", 1)[-1] if is_exact else name
-            cases = find_cases_by_name_substring(substring)
-        if not cases:
-            continue
-
-        for case in cases:
-            case_id = case.get("id")
-            case_name = case.get("name") or ""
-            if not case_id or not case_name:
+    out = []
+    for display_name, key in sorted(test_files.items()):
+        print(f"    · tests of {display_name} in build {build_id}...", flush=True)
+        by_name = {}
+        for cr in find_build_case_results_by_case_name(build_id, key):
+            name = cr["case_name"]
+            if not _matches_key(name, key):
                 continue
-            if case_name in out_by_name:
-                matched_inputs.add((name, is_exact))
+            current = by_name.get(name)
+            if current and current["status"] != "PASSED":
                 continue
-
-            cr = find_case_result_in_build_via_history(
-                build_id, case_id, routine_id=routine_id
-            )
-            if not cr:
-                # Case exists but didn't run in this build. Still count
-                # the input as matched — we don't also want a NOT FOUND
-                # row for it below.
-                matched_inputs.add((name, is_exact))
-                continue
-
-            status = ((cr.get("dueStatus") or {}).get("name") or "UNTESTED").upper()
-            case_result_id = cr.get("id")
-            caseresult_url = None
-            if case_result_id:
-                caseresult_url = testray_case_result_url(
-                    case_result_id,
+            by_name[name] = {
+                "test_file": display_name,
+                "case_name": name,
+                "status": cr["status"],
+                "caseresult_url": testray_case_result_url(
+                    cr["id"],
                     project_id=LIFERAY_PORTAL_PROJECT_ID,
                     routine_id=routine_id,
                     build_id=build_id,
-                )
-            out_by_name[case_name] = {
-                "case_name": case_name,
-                "status": status,
-                "caseresult_url": caseresult_url,
+                ) if cr.get("id") else None,
             }
-            matched_inputs.add((name, is_exact))
-
-    out = list(out_by_name.values())
-    for name, _is_exact in sorted(test_search_names - matched_inputs):
-        out.append(
-            {
-                "case_name": name,
-                "status": "NOT FOUND",
+        if not by_name:
+            out.append({
+                "test_file": display_name,
+                "case_name": None,
+                "status": "NOT RUN",
                 "caseresult_url": None,
-            }
-        )
-
-    out.sort(key=lambda e: (e["status"] != "FAILED", e["case_name"]))
+            })
+        out.extend(sorted(by_name.values(), key=lambda e: e["case_name"]))
     return out
 
 
@@ -831,12 +708,20 @@ def _log_ticket_result(r):
         print(f"  - {key}: skipped ({reason})")
         return
 
-    counts = {}
-    for tr in r["test_results"]:
-        counts[tr["status"]] = counts.get(tr["status"], 0) + 1
-    pretty = ", ".join(f"{v} {k}" for k, v in sorted(counts.items())) or "no matching cases"
+    pretty = _format_status_counts(r["test_results"])
     routine_name = r.get("routine_name") or "Acceptance"
     print(
         f"  - {key}: {routine_name} build {r['build_id']} "
         f"(SHA {(r['commit_sha'] or '')[:12]}) → {pretty}"
     )
+
+
+def _format_status_counts(rows):
+    """"1 FAILED, 10 PASSED" for a set of result rows; failures first."""
+    if rows and all(tr["case_name"] is None for tr in rows):
+        return "NOT RUN in this build"
+    counts = {}
+    for tr in rows:
+        counts[tr["status"]] = counts.get(tr["status"], 0) + 1
+    order = sorted(counts, key=lambda k: (k == "PASSED", k))
+    return ", ".join(f"{counts[k]} {k}" for k in order) or "no tests"

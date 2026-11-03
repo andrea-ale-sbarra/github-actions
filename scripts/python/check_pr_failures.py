@@ -15,7 +15,7 @@ For every Jira ticket carrying a routine's `check_label` (the developer's
      (Commerce / UM) if Acceptance hasn't seen the merge yet.
   4. Matches the test files the PR added/modified against the cases that
      ran in that build and prints each one's status (PASSED, FAILED,
-     BLOCKED, NOT FOUND, etc.).
+     BLOCKED, NOT RUN, etc.).
 
 The output is a Slack-ready block, ready to be copy-pasted. Nothing is
 written to Jira, GitHub, or Testray. Use it during the day when the main
