@@ -101,3 +101,22 @@ These replace the main analyzer, they don't run alongside it.
 - **DRY_RUN (default)** — no write calls to Jira or Testray; every action is logged as "would do".
 - **LIVE (`--live`)** — real changes on Jira (ticket create/update/close) and Testray (task assignment).
 - **RESUME (`--resume`)** — instead of starting from the newest build, resumes the most recent already-open analysis task. Useful to resume an interrupted execution or to re-iterate on the same build.
+
+## Changing the scripts
+
+Every change to these scripts explains its context and its reasons, split between the code and the commit message. The rules the analyzer applies (what to skip, how failures are grouped, when a ticket is closed) come from cases met on real builds, and a reader without that history would undo them.
+
+**In the code**, next to the rule, a comment says what a future reader needs in order not to undo it:
+
+- why the rule exists, with the case that triggered it (Jira ticket, Testray build id);
+- what the rule deliberately does not do, and why (e.g. "a shard row with no failing test still opens a ticket: it may be the only trace of a crash");
+- known limits and open points.
+
+**In the commit message**, the history of the decision:
+
+- the problem seen, with tickets and builds;
+- the evidence the change was checked against (which builds, what came out, e.g. "every failing shard row of builds 556026987 and 559103559 has a failing test in the same shard");
+- alternatives considered and why they were dropped;
+- what changes in behavior.
+
+Don't copy the same text in both places: the comment keeps what stays true as long as the code does, the commit keeps how the decision was reached. Check a rule in dry run, or with a read-only script on real builds, before committing it, and write in the commit what came out.
