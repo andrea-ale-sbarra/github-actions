@@ -1287,11 +1287,19 @@ def _playwright_shard_row_keys(result):
     return _playwright_shard_of(result) | {str(result.get("id"))}
 
 
+# Error of a Playwright test row that never started: its shard was cut
+# (e.g. by test timeouts) before reaching it. The same text for any cause,
+# so matching it by text bundles unrelated tests into one ticket (it did
+# in LPD-109375).
+_PLAYWRIGHT_NOT_RUN_ERROR = "Failed to run test on CI"
+
+
 def _failing_playwright_tests(build_id):
     """Return `{"error", "shard"}` for each failing Playwright test of the
     build, shard rows excluded. `shard` is the set of keys of the shard the
     test ran in (see `_playwright_shard_of`), empty when its row has no
-    such attachment. Poshi and Java rows are
+    such attachment. Tests that never started are not failing tests: they
+    are the consequence of the shard stopping. Poshi and Java rows are
     left out: a failing Poshi test must not hide a broken Playwright shard."""
     tests = []
     for r in get_all_build_case_results(build_id, include_case=True):
@@ -1300,6 +1308,7 @@ def _failing_playwright_tests(build_id):
         if (
             error
             and ".spec.ts" in case_name
+            and _PLAYWRIGHT_NOT_RUN_ERROR not in error
             and not _playwright_shard_host(error)
             and not _playwright_shard_summary(error)
         ):
@@ -1334,6 +1343,22 @@ def _is_tracked_playwright_shard(result, failing_tests):
     return bool(summary) and any(summary in t["error"] for t in failing_tests)
 
 
+def _is_not_run_in_failed_shard(result, failing_tests):
+    """Return True when this Playwright test never started and a test of
+    its shard failed: that failure stopped the shard and gets the ticket.
+
+    Checked on builds 558094028 and 559103559: every "Failed to run test on
+    CI" row sat in shard 17/0, cut by the timeouts of LPD-112455 and
+    LPD-112456. A test that never started in a shard with no failing test
+    (or with no attachment to tell its shard) still opens a ticket: the row
+    is then the only trace that the test does not run.
+    """
+    if _PLAYWRIGHT_NOT_RUN_ERROR not in (result.get("errors") or ""):
+        return False
+    shard = _playwright_shard_of(result)
+    return any(t["shard"] & shard for t in failing_tests)
+
+
 def _scan_unique_failures(subtask_id, results, failing_tests=()):
     """
     Return (unique_failures:list[dict], first_result_skipped:bool).
@@ -1343,7 +1368,8 @@ def _scan_unique_failures(subtask_id, results, failing_tests=()):
     same shard carries its failure: the test row gets the ticket. A shard
     with no such test (a crash outside any test, a whole-shard timeout no
     test repeats, or a row whose shard the attachments do not tell) still
-    gets one, since its row may be the only trace.
+    gets one, since its row may be the only trace. A test that never
+    started is skipped on the same terms (`_is_not_run_in_failed_shard`).
     """
     unique_failures = []
     first_result = True
@@ -1369,6 +1395,9 @@ def _scan_unique_failures(subtask_id, results, failing_tests=()):
             _log_skipped_result(r, error)
             continue
         if _is_tracked_playwright_shard(r, failing_tests):
+            _log_skipped_result(r, error)
+            continue
+        if _is_not_run_in_failed_shard(r, failing_tests):
             _log_skipped_result(r, error)
             continue
 
@@ -1894,6 +1923,7 @@ def _should_skip_result(error):
         "The build failed prior to running the test",
         "test-portal-testsuite-upstream-downstream(master) timed out after",
         "Unable to run test on CI",
+        "Unable to run on CI",
     ]
     return any(keyword in (error or "") for keyword in skip_error_keywords)
 
