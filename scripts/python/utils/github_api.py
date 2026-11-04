@@ -1,6 +1,6 @@
 """Thin GitHub REST API wrapper used by the PR review check.
 
-We only call one endpoint: `compare/{base}...{head}`. The PR review check
+We call `compare/{base}...{head}` and `contents/{path}`. The PR review check
 identifies the merge by parsing the "View total diff" link that the final
 reviewer leaves on the Jira ticket (form `<base>...<head>`), and the
 compare endpoint gives us back the list of files that range touched.
@@ -11,6 +11,7 @@ liferay/liferay-portal) are public, so any valid PAT works — no scopes
 needed; authenticating just lifts the rate limit from 60 to 5000 req/h.
 """
 
+import base64
 import os
 import time
 from functools import lru_cache
@@ -81,6 +82,27 @@ def get_compare(owner, repo, base, head):
         "truncated": len(files) >= 300,
         "head_commit_date": head_commit_date,
     }
+
+
+def get_file_content(owner, repo, path, ref):
+    """Return the text of `path` at `ref`, or None when GitHub does not
+    serve it (deleted file, binary, over the contents API's 1 MB cap).
+
+    The PR review check reads each touched test file at the merge HEAD to
+    map the changed lines of the patch to the tests that contain them.
+    """
+    try:
+        payload = _get_json(
+            f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}?ref={ref}"
+        ) or {}
+    except Exception:
+        return None
+    if payload.get("encoding") != "base64" or not payload.get("content"):
+        return None
+    try:
+        return base64.b64decode(payload["content"]).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
 
 
 def _get_commit_committer_date(owner, repo, sha):

@@ -55,7 +55,7 @@ from testray_api import (
     ACCEPTANCE_ROUTINE_ID,
     LIFERAY_PORTAL_PROJECT_ID,
 )
-from github_api import get_compare, is_ancestor
+from github_api import get_compare, get_file_content, is_ancestor
 
 # Modes for `check_pr_failures_for_routine`. They differ along two axes:
 #
@@ -99,8 +99,10 @@ _COMPARE_URL_RE = re.compile(
 
 # Test files in the merge diff. Any change to one of these puts ALL of its
 # tests in the check, whatever the change was (new test, edited test,
-# renamed title): the reader opens the build and finds the test they
-# care about, so we don't try to work out which test the diff touched.
+# renamed title): a change to code shared by the file's tests can break
+# any of them. The report then marks which of those tests the diff
+# changed (`_find_pr_tests`), so a failure of another test of the same
+# file is not read as the PR's.
 #   • Java integration / unit:   *Test.java, *IT.java
 #   • Playwright / Jest / Vitest: *.spec.{ts,tsx,js,jsx,mjs},
 #                                 *.test.{ts,tsx,js,jsx,mjs}
@@ -247,23 +249,52 @@ def format_pr_check_block(routine, results):
             meta_parts.append(f"{routine_name} build {build_id}: {build_url}")
         lines.append(ticket_line + " - " + " | ".join(meta_parts))
 
-        # One line per test file with its counts, then the tests that
-        # did not pass. The passed ones are in the build link above.
+        # One line per test file with its counts. When the diff maps to
+        # tests, the tests the PR changed come first with any status (the
+        # reader needs their link either way), then the other tests of
+        # the file that did not pass, kept apart so a failure the PR did
+        # not touch is not read as the PR's. Otherwise just the tests that
+        # did not pass; the passed ones are in the build link above.
         by_file = {}
         for tr in r["test_results"]:
             by_file.setdefault(tr["test_file"], []).append(tr)
         for test_file, rows in by_file.items():
             lines.append(f"    {test_file}: {_format_status_counts(rows)}")
-            for tr in rows:
-                if tr["case_name"] is None or tr["status"] == "PASSED":
-                    continue
-                label = f"[{tr['status']}]"
-                if tr.get("caseresult_url"):
-                    lines.append(
-                        f"        {label} {tr['case_name']} ({tr['caseresult_url']})"
-                    )
-                else:
-                    lines.append(f"        {label} {tr['case_name']}")
+            info = (r.get("pr_tests") or {}).get(test_file) or {}
+            if info.get("titles") is None:
+                lines.extend(
+                    _format_result_line(tr, "        ")
+                    for tr in rows
+                    if tr["case_name"] is not None and tr["status"] != "PASSED"
+                )
+                continue
+
+            pr_rows = [tr for tr in rows if tr.get("pr_test")]
+            lines.append("        Tests changed by the PR:")
+            if pr_rows:
+                lines.extend(_format_result_line(tr, "            ") for tr in pr_rows)
+            elif info["leaf_titles"]:
+                titles = ", ".join(sorted(info["leaf_titles"]))
+                lines.append(f"            none in this build ({titles})")
+            else:
+                lines.append("            none (the PR changes no test body)")
+
+            other_failed = [
+                tr for tr in rows
+                if tr["case_name"] is not None
+                and not tr.get("pr_test")
+                and tr["status"] != "PASSED"
+            ]
+            if other_failed:
+                why = (
+                    "the PR also changes code shared by every test of the file"
+                    if info["shared_changed"]
+                    else "not changed by the PR"
+                )
+                lines.append(f"        Other tests of the file that did not pass ({why}):")
+                lines.extend(
+                    _format_result_line(tr, "            ") for tr in other_failed
+                )
 
     lines.append("")
     return lines
@@ -342,8 +373,9 @@ def _check_ticket(issue, builds_by_routine, routine_lookup_order, prefer_latest)
             "routine_name": str | None,
             "test_results": [
                 {"test_file": str, "case_name": str | None, "status": str,
-                 "caseresult_url": str | None}
+                 "caseresult_url": str | None, "pr_test": bool | None}
             ],
+            "pr_tests": {test_file: info},  # see _find_pr_tests
         }
     """
     key = issue.key
@@ -450,8 +482,13 @@ def _check_ticket(issue, builds_by_routine, routine_lookup_order, prefer_latest)
         f"    · looking up test cases in build {build_id} (targeted query)...",
         flush=True,
     )
+    print("    · mapping the diff to the tests it changes...", flush=True)
+    pr_tests = _find_pr_tests(
+        cmp_info.get("files") or [], owner, repo, head_sha
+    )
+    base["pr_tests"] = pr_tests
     base["test_results"] = _collect_test_results(
-        build_id, test_files, routine_id
+        build_id, test_files, routine_id, pr_tests
     )
     base["status"] = "checked"
     base["skip_reason"] = None
@@ -540,23 +577,174 @@ def _derive_test_files(changed_files):
     """
     files = {}
     for f in changed_files:
-        filename = (f.get("filename") or "").strip()
-        if not filename or not _TEST_FILENAME_RE.search(filename):
-            continue
-        base = filename.rsplit("/", 1)[-1]
-
-        fqn_match = _JAVA_FQN_PATH_RE.search(filename)
-        if fqn_match:
-            fqn = fqn_match.group(1).replace("/", ".")
-            files[fqn] = fqn
-        elif base.endswith(".testcase"):
-            files[base] = f"LocalFile.{base[:-len('.testcase')]}#"
-        elif _PLAYWRIGHT_TESTS_DIR in filename:
-            spec = filename.split(_PLAYWRIGHT_TESTS_DIR, 1)[1]
-            files[spec] = spec
-        else:
-            files[base] = base
+        entry = _test_file_entry((f.get("filename") or "").strip())
+        if entry:
+            display_name, key, _kind = entry
+            files[display_name] = key
     return files
+
+
+def _test_file_entry(filename):
+    """Return `(display_name, case_name_key, kind)` for a test file, or
+    None for any other file. `kind` is "java", "poshi" or "js"."""
+    if not filename or not _TEST_FILENAME_RE.search(filename):
+        return None
+    base = filename.rsplit("/", 1)[-1]
+
+    fqn_match = _JAVA_FQN_PATH_RE.search(filename)
+    if fqn_match:
+        fqn = fqn_match.group(1).replace("/", ".")
+        return fqn, fqn, "java"
+    if base.endswith(".testcase"):
+        return base, f"LocalFile.{base[:-len('.testcase')]}#", "poshi"
+    if _PLAYWRIGHT_TESTS_DIR in filename:
+        spec = filename.split(_PLAYWRIGHT_TESTS_DIR, 1)[1]
+        return spec, spec, "js"
+    return base, base, "js"
+
+
+# Start of a test block, per kind. Group 1 is the indentation, which
+# closes the block: the first later line with the same indentation that
+# starts with `)` or `}`. Liferay sources are formatted, so this holds
+# without parsing the language.
+_TEST_BLOCK_START_RE = {
+    "js": re.compile(
+        r"^(\s*)(?:test|it|describe)(?:\.(?:describe|only|skip|fixme|fail|serial|parallel))*\("
+    ),
+    "java": re.compile(r"^(\s*)public void (\w+)\("),
+    "poshi": re.compile(r"^(\s*)test (\w+) \{"),
+}
+
+# First string literal after a JS `test(` / `describe(`: the title, often
+# on the line after the call when the formatter wraps it.
+_JS_TITLE_RE = re.compile(r"""\(\s*(['"`])((?:\\.|(?!\1).)*)\1""", re.DOTALL)
+
+_HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+
+def _find_pr_tests(changed_files, owner, repo, head_sha):
+    """Return `{display_name: info}` telling which tests of each touched
+    test file the PR changed.
+
+    info = {
+        "titles": set | None,   # tests (and describe blocks) containing
+                                # a changed line; None = could not tell
+        "leaf_titles": set,     # innermost blocks only: the tests the
+                                # reader expects to find in the build
+        "shared_changed": bool, # a changed line outside every test
+                                # (imports, fixtures, helpers), which
+                                # can break any test of the file
+    }
+
+    The patch gives the changed line numbers; the file at the merge HEAD
+    gives the test blocks around them. Deleted lines count at the line
+    where they were removed.
+    """
+    out = {}
+    for f in changed_files:
+        filename = (f.get("filename") or "").strip()
+        entry = _test_file_entry(filename)
+        if not entry:
+            continue
+        display_name, _key, kind = entry
+        unknown = {"titles": None, "leaf_titles": set(), "shared_changed": False}
+        patch = f.get("patch")
+        content = (
+            get_file_content(owner, repo, filename, head_sha)
+            if patch and f.get("status") != "removed"
+            else None
+        )
+        if not content:
+            out[display_name] = unknown
+            continue
+
+        blocks = _test_blocks(content, kind)
+        titles, leaf_titles, shared_changed = set(), set(), False
+        for line_no in _changed_line_numbers(patch):
+            around = [b for b in blocks if b[0] <= line_no <= b[1]]
+            if not around:
+                shared_changed = True
+                continue
+            titles.update(b[2] for b in around)
+            leaf_titles.add(max(around, key=lambda b: b[0])[2])
+        out[display_name] = {
+            "titles": titles,
+            "leaf_titles": leaf_titles,
+            "shared_changed": shared_changed,
+        }
+    return out
+
+
+def _test_blocks(content, kind):
+    """Return `(start_line, end_line, title)` for every test block of the
+    file, 1-based and inclusive."""
+    lines = content.split("\n")
+    start_re = _TEST_BLOCK_START_RE[kind]
+    blocks = []
+    for i, line in enumerate(lines):
+        match = start_re.match(line)
+        if not match:
+            continue
+        indent = match.group(1)
+        if kind == "js":
+            title_match = _JS_TITLE_RE.search("\n".join(lines[i:i + 5]))
+            if not title_match:
+                continue
+            title = title_match.group(2)
+        elif kind == "java" and not any(
+            prev.strip().startswith("@Test") for prev in lines[max(0, i - 3):i]
+        ):
+            continue  # setUp, helpers: code shared by the tests
+        else:
+            title = match.group(2)
+        end = len(lines)
+        for j in range(i + 1, len(lines)):
+            other = lines[j]
+            if other.startswith(indent) and other[len(indent):][:1] in (")", "}"):
+                end = j + 1
+                break
+        blocks.append((i + 1, end, title))
+    return blocks
+
+
+def _changed_line_numbers(patch):
+    """Line numbers, in the new file, of the lines the patch adds, plus
+    the line where each run of deleted lines used to be."""
+    changed = set()
+    new_line = 0
+    for line in patch.split("\n"):
+        header = _HUNK_HEADER_RE.match(line)
+        if header:
+            new_line = int(header.group(1))
+            continue
+        if line.startswith("+"):
+            changed.add(new_line)
+            new_line += 1
+        elif line.startswith("-"):
+            changed.add(new_line)
+        elif line.startswith("\\"):
+            continue
+        else:
+            new_line += 1
+    return changed
+
+
+def _is_pr_test(case_name, key, titles):
+    """True when the Testray case `case_name` of the file `key` is one of
+    the tests the PR changed.
+
+      • JS: "<spec> > <title>", the title being a test or a describe.
+      • Poshi: "LocalFile.<Name>#<test>".
+      • Java: "<FQN>" for the whole class, or "<FQN>#<method>".
+    """
+    rest = case_name[len(key):]
+    if key.endswith("#"):
+        return rest in titles
+    if rest.startswith("#"):
+        return rest[1:].split("[", 1)[0] in titles
+    if rest.startswith(" > "):
+        return any(part in titles for part in rest[3:].split(" > "))
+    return bool(titles)
 
 
 def _matches_key(case_name, key):
@@ -659,18 +847,23 @@ def _find_build_containing(
     return None
 
 
-def _collect_test_results(build_id, test_files, routine_id):
+def _collect_test_results(build_id, test_files, routine_id, pr_tests=None):
     """Return one row per test of each changed test file that ran in
     `build_id`, plus a NOT RUN row for a file with no test in the build
     (deleted file, test not part of this routine, case not yet created).
 
-    Row shape: {"test_file", "case_name", "status", "caseresult_url"}.
+    Row shape: {"test_file", "case_name", "status", "caseresult_url",
+    "pr_test"}. `pr_test` is True for a test the PR changed, False for
+    another test of the same file, None when the diff could not be
+    mapped to tests (see `_find_pr_tests`).
     One row per case name: a case that ran more than once keeps the
     worst status, so a FAILED retry is never hidden by a PASSED one.
     """
+    pr_tests = pr_tests or {}
     out = []
     for display_name, key in sorted(test_files.items()):
         print(f"    · tests of {display_name} in build {build_id}...", flush=True)
+        titles = (pr_tests.get(display_name) or {}).get("titles")
         by_name = {}
         for cr in find_build_case_results_by_case_name(build_id, key):
             name = cr["case_name"]
@@ -682,6 +875,9 @@ def _collect_test_results(build_id, test_files, routine_id):
             by_name[name] = {
                 "test_file": display_name,
                 "case_name": name,
+                "pr_test": (
+                    None if titles is None else _is_pr_test(name, key, titles)
+                ),
                 "status": cr["status"],
                 "caseresult_url": testray_case_result_url(
                     cr["id"],
@@ -694,11 +890,19 @@ def _collect_test_results(build_id, test_files, routine_id):
             out.append({
                 "test_file": display_name,
                 "case_name": None,
+                "pr_test": None,
                 "status": "NOT RUN",
                 "caseresult_url": None,
             })
         out.extend(sorted(by_name.values(), key=lambda e: e["case_name"]))
     return out
+
+
+def _format_result_line(tr, indent):
+    line = f"{indent}[{tr['status']}] {tr['case_name']}"
+    if tr.get("caseresult_url"):
+        line += f" ({tr['caseresult_url']})"
+    return line
 
 
 def _log_ticket_result(r):
@@ -709,6 +913,9 @@ def _log_ticket_result(r):
         return
 
     pretty = _format_status_counts(r["test_results"])
+    pr_rows = [tr for tr in r["test_results"] if tr.get("pr_test")]
+    if pr_rows:
+        pretty = f"PR tests: {_format_status_counts(pr_rows)} | all: {pretty}"
     routine_name = r.get("routine_name") or "Acceptance"
     print(
         f"  - {key}: {routine_name} build {r['build_id']} "
