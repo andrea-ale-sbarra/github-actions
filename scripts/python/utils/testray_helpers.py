@@ -1035,7 +1035,7 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
     so a crash mid-loop doesn't force a full restart on the next run.
     """
     subtasks = get_task_subtasks(task_id)
-    failing_test_errors = _failing_test_errors(latest_build_id)
+    failing_tests = _failing_playwright_tests(latest_build_id)
 
     for subtask in subtasks:
         subtask_id = subtask["id"]
@@ -1056,7 +1056,7 @@ def _process_task_subtasks(*, task_id, latest_build_id, epic, acceptance_build_i
 
         # 2) Scan current results for unique failures (skip known errors)
         unique_failures, first_result_skipped = _scan_unique_failures(
-            subtask_id, results, failing_test_errors
+            subtask_id, results, failing_tests
         )
 
         # Group failures by normalized error so each group can map to its own issue(s)
@@ -1218,7 +1218,6 @@ def _backfill_subtask_issues_if_needed(subtask_id, subtask, results):
 _PLAYWRIGHT_SHARD_HOST_RE = re.compile(
     r"Stopping container \[ID: '\w+', name: '(i-[0-9a-f]+)_playwright'\]"
 )
-_CI_HOST_RE = re.compile(r"\bi-[0-9a-f]{8,}\b")
 
 
 def _playwright_shard_host(error):
@@ -1246,53 +1245,105 @@ def _playwright_shard_summary(error):
     return None
 
 
-def _failing_test_errors(build_id):
-    """Return the errors of the build's failing tests, shard rows excluded."""
-    errors = []
-    for r in get_all_build_case_results(build_id):
+# A Playwright test row links the row of the shard that ran it: an
+# attachment named after the shard ("playwright-js-tomcat101-postgresql163/
+# 17/0") whose value is ".../case-result/<shard row id>". Older rows only
+# carry log attachments under the CI job and shard: ".../test-portal-
+# testsuite-upstream(master)/1917/playwright-js-tomcat101-postgresql163/16/
+# 0/liferay-log.txt.gz". The job matters there: a build merges two jobs
+# (testsuite and acceptance), and the same shard name can exist in both.
+_PLAYWRIGHT_SHARD_LINK_RE = re.compile(r"case-result/(\d+)")
+_PLAYWRIGHT_SHARD_PATH_RE = re.compile(r"/([^/]+/\d+)/(playwright-js-[^/]+/\d+/\d+)/")
+
+
+def _playwright_attachments(result):
+    try:
+        return json.loads(result.get("attachments") or "[]") or []
+    except (TypeError, ValueError):
+        return []
+
+
+def _playwright_shard_of(result):
+    """Return the shard keys of a Playwright row from its attachments: the
+    id of the shard row it links, and `(job, shard)` from its log paths.
+    A shard row has its own id. Empty when no attachment tells."""
+    keys = set()
+    for attachment in _playwright_attachments(result):
+        name = attachment.get("name") or ""
+        value = attachment.get("value") or ""
+        if name.startswith("playwright-js-"):
+            link = _PLAYWRIGHT_SHARD_LINK_RE.search(value)
+            if link:
+                keys.add(link.group(1))
+        for field in (value, attachment.get("url") or ""):
+            path = _PLAYWRIGHT_SHARD_PATH_RE.search(field)
+            if path:
+                keys.add((path.group(1), path.group(2)))
+    return keys
+
+
+def _playwright_shard_row_keys(result):
+    """Shard keys of a shard row: its own id plus its log paths."""
+    return _playwright_shard_of(result) | {str(result.get("id"))}
+
+
+def _failing_playwright_tests(build_id):
+    """Return `{"error", "shard"}` for each failing Playwright test of the
+    build, shard rows excluded. `shard` is the set of keys of the shard the
+    test ran in (see `_playwright_shard_of`), empty when its row has no
+    such attachment. Poshi and Java rows are
+    left out: a failing Poshi test must not hide a broken Playwright shard."""
+    tests = []
+    for r in get_all_build_case_results(build_id, include_case=True):
         error = r.get("errors") or ""
+        case_name = (r.get("r_caseToCaseResult_c_case") or {}).get("name") or ""
         if (
             error
+            and ".spec.ts" in case_name
             and not _playwright_shard_host(error)
             and not _playwright_shard_summary(error)
         ):
-            errors.append(error)
-    return errors
+            tests.append({"error": error, "shard": _playwright_shard_of(r)})
+    return tests
 
 
-def _is_tracked_playwright_shard(error, failing_test_errors):
+def _is_tracked_playwright_shard(result, failing_tests):
     """Return True when a test row of the build already carries the
     failure of this Playwright shard row.
 
-    Tests that call an API carry their host in the request URL, so a shard
-    whose host shows up there is tracked on a test row. A shard whose row
-    repeats a test error is tracked on the test row that has that error.
+    A console-tail shard row ("[exec] 111 passed (30.6m) [exec] Stopping
+    container ...") is tracked when a Playwright test that ran in the same
+    shard failed: the shard failed because that test did, and the test row
+    gets the ticket. Job and shard come from the log attachments of both
+    rows. A shard row repeating a test error is tracked on the test row
+    that has that error.
     """
-    # Still open: a console-tail shard row ("[exec] 17 passed (13.1m)
-    # [exec] Stopping container ...") whose host appears in no test error,
-    # because its failing tests call no API. A dry run on builds 550991789
-    # and 555468323 (2026-11-03) left about ten such rows opening tickets.
-    # Do not skip them blindly: a crashed shard leaves the same row as the
-    # only trace. Add a rule only when one of those tickets, investigated,
-    # turns out to repeat a failure already tracked on a test row, and take
-    # the shard-to-test link from that case (e.g. the spec files the shard
-    # ran, if Testray exposes them), not from the error text alone.
-    host = _playwright_shard_host(error)
-    if host:
-        return any(host in _CI_HOST_RE.findall(e) for e in failing_test_errors)
+    # A console-tail shard row still opens a ticket when no failing test
+    # ran in its shard (a crash outside any test leaves that row as the
+    # only trace), or when the attachments do not say which shard it is:
+    # with no link to its tests, the row is the only signal. Checked on
+    # builds 556026987 and 559103559: every failing shard row had failing
+    # tests in the same shard (e.g. LPD-113034, shard 16, repeats
+    # LPD-112454). Matching any failing test of the build instead would let
+    # one red test elsewhere hide a crashed shard.
+    error = result.get("errors") or ""
+    if _playwright_shard_host(error):
+        shard = _playwright_shard_row_keys(result)
+        return any(t["shard"] & shard for t in failing_tests)
     summary = _playwright_shard_summary(error)
-    return bool(summary) and any(summary in e for e in failing_test_errors)
+    return bool(summary) and any(summary in t["error"] for t in failing_tests)
 
 
-def _scan_unique_failures(subtask_id, results, failing_test_errors=()):
+def _scan_unique_failures(subtask_id, results, failing_tests=()):
     """
     Return (unique_failures:list[dict], first_result_skipped:bool).
     We short-circuit the subtask if the first result matches a global skip.
 
-    A Playwright shard row is skipped when one of the build's failing tests
-    carries its failure: the test row gets the ticket. A shard with no such
-    test (a crash, a whole-shard timeout, or tests whose error names no
-    host) still gets one, since its row may be the only trace.
+    A Playwright shard row is skipped when a failing Playwright test of the
+    same shard carries its failure: the test row gets the ticket. A shard
+    with no such test (a crash outside any test, a whole-shard timeout no
+    test repeats, or a row whose shard the attachments do not tell) still
+    gets one, since its row may be the only trace.
     """
     unique_failures = []
     first_result = True
@@ -1317,7 +1368,7 @@ def _scan_unique_failures(subtask_id, results, failing_test_errors=()):
         if _should_skip_result(error):
             _log_skipped_result(r, error)
             continue
-        if _is_tracked_playwright_shard(error, failing_test_errors):
+        if _is_tracked_playwright_shard(r, failing_tests):
             _log_skipped_result(r, error)
             continue
 
