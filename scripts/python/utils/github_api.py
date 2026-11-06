@@ -105,6 +105,51 @@ def get_file_content(owner, repo, path, ref):
         return None
 
 
+def find_file_paths(owner, repo, filename):
+    """Repository paths of the files named `filename` (GitHub code search,
+    needs GITHUB_TOKEN). Empty list when the search fails: callers treat
+    the path as unknown, not as an error."""
+    from urllib.parse import quote_plus
+
+    url = (
+        f"{GITHUB_API}/search/code?per_page=20&q="
+        + quote_plus(f"filename:{filename} repo:{owner}/{repo}")
+    )
+    try:
+        payload = _get_json(url) or {}
+    except RequestException as e:
+        print(f"⚠ GitHub code search for {filename} failed: {e}")
+        return []
+    return [i.get("path") for i in payload.get("items") or [] if i.get("path")]
+
+
+def get_commits_for_path(owner, repo, path, head, since, until, limit=100):
+    """Commits reachable from `head` that touch `path` with a committer date
+    in [since, until] (ISO 8601), newest first, as {sha, message, author}.
+
+    Unlike compare, this is not capped at 250 commits for the whole range:
+    the path filter keeps the list to what concerns one module, which is
+    what the triage needs (the range between two routine builds held 707
+    commits on 2026-11-05)."""
+    url = (
+        f"{GITHUB_API}/repos/{owner}/{repo}/commits?sha={head}&path={path}"
+        f"&since={since}&until={until}&per_page={limit}"
+    )
+    return [
+        {
+            "sha": c.get("sha"),
+            "message": ((c.get("commit") or {}).get("message") or "").split("\n")[0],
+            "author": ((c.get("commit") or {}).get("author") or {}).get("name"),
+        }
+        for c in _get_json(url) or []
+    ]
+
+
+def get_commit_date(owner, repo, sha):
+    """Committer date (ISO 8601) of `sha`, or None."""
+    return _get_commit_committer_date(owner, repo, sha)
+
+
 def _get_commit_committer_date(owner, repo, sha):
     """One-shot fallback for when the compare range carries no commits."""
     try:

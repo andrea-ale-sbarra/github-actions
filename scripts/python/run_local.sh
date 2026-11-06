@@ -41,6 +41,7 @@ export FORCE=false
 export ABANDON=false
 SUBCOMMAND=""
 BUILD_IDS=()
+TRIAGE_ARGS=()
 
 while (( $# > 0 )); do
     case "$1" in
@@ -51,11 +52,12 @@ while (( $# > 0 )); do
         --priorities|--summary|--diagnose|--inspect|--check-pr-failures|--poshi-burndown) SUBCOMMAND="$1" ;;
         --routine) shift; export ROUTINE="$1" ;;
         --routine=*) export ROUTINE="${1#--routine=}" ;;
+        --triage) shift; SUBCOMMAND="--triage"; TRIAGE_ARGS=("$@"); break ;;
         --build) shift; SUBCOMMAND="--build"; BUILD_IDS+=("$1") ;;
         --build=*) SUBCOMMAND="--build"; BUILD_IDS+=("${1#--build=}") ;;
         *)
             echo "❌ Argomento non riconosciuto: $1"
-            echo "   Usa: --live | --force | --abandon | --resume | --routine <name|id> | --priorities | --summary | --inspect | --diagnose | --check-pr-failures | --poshi-burndown | --build <id>"
+            echo "   Usa: --live | --force | --abandon | --resume | --routine <name|id> | --priorities | --summary | --inspect | --diagnose | --check-pr-failures | --poshi-burndown | --build <id> | --triage ticket <LPD-X...> | --triage build <routine> [<id>]"
             exit 1
             ;;
     esac
@@ -103,6 +105,11 @@ if [[ "$SUBCOMMAND" == "--poshi-burndown" ]]; then
     echo "📉 Conteggio Poshi rimasti da convertire (scan dei file sorgente)..."
     cd "$SCRIPT_DIR"
     uv run poshi_burndown.py
+    exit 0
+fi
+if [[ "$SUBCOMMAND" == "--triage" ]]; then
+    cd "$SCRIPT_DIR"
+    uv run triage_context.py "${TRIAGE_ARGS[@]}"
     exit 0
 fi
 if [[ "$SUBCOMMAND" == "--build" ]]; then
