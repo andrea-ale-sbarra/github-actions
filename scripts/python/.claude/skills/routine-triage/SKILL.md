@@ -84,6 +84,18 @@ Known gap: for Playwright specs (`modules/test/playwright/...`) the helper lists
 
 Look across tickets, not only one by one: tickets whose tests went red in the same range with the same error family (e.g. 2026-11-06: LPD-113261, LPD-113264, LPD-111085, LPD-111078, all on a modal `iframe` locator after LPD-110897 changed how commerce dialogs open) are one cause, to be handled once.
 
+### Go deep: no token budget
+
+A verdict from the helper output alone is shallow (2026-11-06: the first pass read only history and commit lists and called four tickets "uncertain" or "CI"; the deep pass found the cause of three). For every ticket in scope, before giving a verdict:
+
+1. **Read the failing step.** Full error from the Testray result (`get_all_build_case_results(build, include_case=True)`, field `errors`), and the test source at the red SHA (`get_file_content` in `utils/github_api.py`): which step, which locator or assertion. A failure in a later step when an earlier one used the same locator says "state/timing", not "locator".
+2. **Narrow the range with Acceptance.** Acceptance runs daily and shares most tests: take the test's Acceptance history (`fetch_case_results(case_id, 590307)`) and the SHA of the last Acceptance build where it passed; if that SHA contains the routine's last green SHA, the real range is (that SHA ... routine red SHA), often hours instead of days (`is_ancestor`). Commits already in a passing build are ruled out.
+3. **Read the whole narrowed range**, not only the app folder: `GET /repos/liferay/liferay-portal/compare/<green>...<red>` lists every commit. Look first for tooling changes (Playwright / Chromium / Node / dependency upgrades, `LRCI-*` test-fix sweeps) and read their diffs and messages: on 2026-11-06 LRCI-8461 (Playwright 1.63, Chromium 153) explained LPD-114278/114279 (`cell` → `columnheader`), found only this way.
+4. **Read the diff of each suspect commit** (`GET /repos/.../commits/<sha>`, `files[].patch`) and say what in it touches the failing step.
+5. **Set-up errors** (`TEST_SETUP_ERROR`, instance cleanup): the failing test is usually the victim. Find the batch axis from the result attachments (`.../functional-…/0/N/...`), list the other results of the same axis, and the test that ran right before it; repeat on the previous builds where the error occurred and look for the same predecessor. Search the source for the error message (GitHub code search) and read the comment and the tickets around it (e.g. HeadlessPortalInstanceAPI, LPD-107498/107499).
+6. **Logs you cannot read** (Liferay log, Poshi/Playwright reports on GCS need a Google login): name the exact file and what to look for in it as the next step.
+7. **Re-check earlier verdicts** when new evidence touches them (2026-11-06: LPD-114280 had been closed as CI; it went red in the same range as the Chromium upgrade, so its comment says the closure is weaker).
+
 ## Step 6 — Verdict per ticket
 
 One of:
