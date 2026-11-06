@@ -102,6 +102,8 @@ These replace the main analyzer, they don't run alongside it.
 - **LIVE (`--live`)** — real changes on Jira (ticket create/update/close) and Testray (task assignment).
 - **RESUME (`--resume`)** — instead of starting from the newest build, resumes the most recent already-open analysis task. Useful to resume an interrupted execution or to re-iterate on the same build.
 
+Every analyzer run (dry or live) is also saved to `logs/run-<date>-<time>-<live|dryrun>.log` (gitignored). The closure report, the skipped shard rows and the blocking subtasks are computed only during the run, so the log is the only place they survive.
+
 ## Changing the scripts
 
 Every change to these scripts explains its context and its reasons, split between the code and the commit message. The rules the analyzer applies (what to skip, how failures are grouped, when a ticket is closed) come from cases met on real builds, and a reader without that history would undo them.

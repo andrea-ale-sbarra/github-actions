@@ -129,8 +129,22 @@ else
     echo "   Usa './run_local.sh --routine user_management' per limitare a una sola."
 fi
 
+# Save the whole run to logs/: the closure report, the skipped shard rows and
+# the blocking subtasks are only computed while the analyzer runs (--summary
+# cannot rebuild them), so without a file they are lost with the terminal.
+# The routine-triage skill also reads this file to know which tickets the run
+# created, reused or reopened. PYTHONUNBUFFERED keeps the terminal live: with
+# a pipe Python would otherwise buffer the output until the end.
+LOG_DIR="$SCRIPT_DIR/logs"
+mkdir -p "$LOG_DIR"
+MODE_TAG=$([[ "$DRY_RUN" == "false" ]] && echo live || echo dryrun)
+LOG_FILE="$LOG_DIR/run-$(date +%Y%m%d-%H%M%S)-$MODE_TAG.log"
+export PYTHONUNBUFFERED=1
+echo "📝 Log: $LOG_FILE"
+
 echo "🚀 Avvio analisi in corso..."
 echo ""
 
 cd "$SCRIPT_DIR"
-uv run analyze_testray_results.py
+uv run analyze_testray_results.py 2>&1 | tee "$LOG_FILE"
+exit "${PIPESTATUS[0]}"

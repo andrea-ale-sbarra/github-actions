@@ -1468,6 +1468,13 @@ def _resolve_unique_failures(
             _blocked_update(f["result_id"], blocked_dict["dueStatus"], issue_keys_str)
             for f in unique_failures
         ]
+        # Printed so the run log lists every ticket the run touched: the
+        # create/reuse/reopen paths already print, this history-based reuse
+        # was the only silent one. The routine-triage skill relies on it.
+        print(
+            f"♻ Linking {len(unique_failures)} result(s) of subtask {subtask_id} "
+            f"to {issue_keys_str} (similar error in the test's history)"
+        )
         _comment_new_tests_on_issues(issue_keys_str, unique_failures, latest_build_id)
         return updates, issue_keys_str, True
 
