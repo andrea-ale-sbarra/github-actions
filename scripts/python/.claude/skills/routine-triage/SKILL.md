@@ -12,7 +12,8 @@ Talk to the user in Italian, plain and short. Slack text and Jira comments in En
 ## Guardrails
 
 - `--live` writes to Jira and Testray: that is the normal flow (the workflow is script-driven, see README), so this skill runs it. `--force` and `--abandon` are decisions: never pass them without the user's explicit choice.
-- Never close, link or comment a ticket without approval. Propose, wait, then do exactly the approved list.
+- Every analyzed ticket gets its triage written in a comment, without asking (Step 7): the analysis is only useful if whoever opens the ticket finds it there, not in a chat they never saw (2026-11-06: the punchout suspects of LPD-114276 were only in the chat). Closing and linking need approval: propose, wait, then do exactly the approved list.
+- Never edit the ticket description. The analyzer reads it as data: the "Test Name" table and the {code} errors drive dedup, the reopening of discarded tickets and the --abandon closures.
 - A verdict without evidence is not a verdict: every one cites what supports it (history line, error text, commit, similar ticket). If the evidence is thin, say "incerto" and what is missing.
 - If the triage shows a gap in the script (e.g. a group of duplicates the dedup missed), propose a script change; do not make it inside this skill. Script changes follow README "Changing the scripts".
 
@@ -97,13 +98,26 @@ One of:
 
 Each verdict: one line of conclusion, 1-3 evidence lines, confidence (alta / media / bassa), proposed action.
 
-## Step 7 — Report and approval
+## Step 7 — Write the triage in each ticket, then report and approval
+
+For every ticket in scope add one comment (English, Jira wiki markup), always with this heading so it can be found:
+
+```
+h3. Routine triage (<YYYY-MM-DD>)
+*Verdict:* <verdict> (confidence: high|medium|low)
+* <evidence 1: history, error, commit sha + message + LPD key, similar ticket>
+* <evidence 2>
+*Next step:* <what would confirm it, or who should look>
+```
+
+If the ticket already has a "Routine triage" comment and the verdict and evidence did not change, do not add another; if they changed, add a new one saying what changed. Write these comments before the report, then tell the user which tickets got one.
+
+
 
 Write the report in Italian, grouped by verdict, most actionable first (closable, duplicates), then the rest. Then a numbered action list, e.g.:
 
 1. Chiudere LPD-X (CI): commento "…"
 2. Collegare LPD-Y come doppione di LPD-Z (resta aperto finché il test fallisce)
-3. Commentare LPD-W con il commit sospetto abc123 (LPD-…)
 
 Ask which to apply (the user answers with numbers, "tutte", or edits). Apply only those:
 
