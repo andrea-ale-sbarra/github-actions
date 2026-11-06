@@ -88,6 +88,7 @@ Look across tickets, not only one by one: tickets whose tests went red in the sa
 One of:
 
 - **CI / infrastructure → chiudibile**: CI/harness error (see patterns in `triage_context.py`), network errors against the CI host (`net::ERR_…` on `http://i-…:8080`), or the test already PASSED in the latest build with no product change in between.
+  NOT CI: `TEST_SETUP_ERROR: Unable to delete the portal instances …`. An instance that survives deletion was left dirty by another test (or deletion itself is broken): a signal that something is wrong, to investigate, never to close as noise (Andrea, 2026-11-06; LPD-109582, 109861, 110849, 111086). Look at which test ran before it in the same batch.
 - **Test fragile**: history alternates (≥2 pass/fail flips in 12), no commit on the test file or app explains it, often reopened tickets.
 - **Doppione di LPD-Y**: same test, or same error family (same locator up to a small variation, same exception) as another ticket, or same error cluster in `--triage build`; name the ticket to keep (the oldest still open, or the one someone is working on).
 - **Test da sistemare**: a commit in the range changed the UI/API the test relies on on purpose (renamed label, moved element, removed command); cite the commit.
@@ -101,7 +102,7 @@ Each verdict: one line of conclusion, 1-3 evidence lines, confidence (alta / med
 Write the report in Italian, grouped by verdict, most actionable first (closable, duplicates), then the rest. Then a numbered action list, e.g.:
 
 1. Chiudere LPD-X (CI): commento "…"
-2. Collegare LPD-Y come doppione di LPD-Z e chiuderlo
+2. Collegare LPD-Y come doppione di LPD-Z (resta aperto finché il test fallisce)
 3. Commentare LPD-W con il commit sospetto abc123 (LPD-…)
 
 Ask which to apply (the user answers with numbers, "tutte", or edits). Apply only those:
@@ -112,9 +113,12 @@ import sys; sys.path.insert(0, 'utils')
 from jira_helpers import close_issue, add_comment, _jira
 # close (Discarded), keeps the parent/sub-task rules of the analyzer:
 print(close_issue('LPD-X', '<sha of the latest build>', comment='Closed. Not reproducible in SHA <sha>: <reason>'))
-# duplicate: link, then close with a comment naming the kept ticket:
+# duplicate: link ('LPD-Y duplicates LPD-Z') and comment, but do NOT close
+# while its test still fails: the next run would find it among the recently
+# Discarded tickets with the same test and reopen it as flaky. The analyzer
+# closes it when the test passes.
 _jira().create_issue_link('Duplicate', 'LPD-Y', 'LPD-Z')
-print(close_issue('LPD-Y', '<sha>', comment='Closed. Not reproducible in SHA <sha>: duplicate of LPD-Z'))
+add_comment('LPD-Y', 'Same failure as LPD-Z: <why>. Tracked there. Left open on purpose: ...')
 # comment:
 add_comment('LPD-W', '<text>')
 "
