@@ -113,6 +113,10 @@ These replace the main analyzer, they don't run alongside it.
 
 Every analyzer run (dry or live) is also saved to `logs/run-<date>-<time>-<live|dryrun>.log` (gitignored). The closure report, the skipped shard rows and the blocking subtasks are computed only during the run, so the log is the only place they survive.
 
+## Routine triage skill
+
+`.claude/skills/routine-triage/SKILL.md` (Claude Code, `/routine-triage`) runs the whole daily flow: checks for a new build, runs `--live`, stops on a build out of scale and helps choose `--abandon` / `--force`, reads the run log, gives each new or changed ticket a verdict (CI, flaky, duplicate, test to fix, probable bug) with evidence from `--triage`, and applies on Jira only the actions approved. The skill never changes the scripts; gaps it finds become script changes under the rules below.
+
 ## Changing the scripts
 
 Every change to these scripts explains its context and its reasons, split between the code and the commit message. The rules the analyzer applies (what to skip, how failures are grouped, when a ticket is closed) come from cases met on real builds, and a reader without that history would undo them.

@@ -34,6 +34,7 @@ import re
 import statistics
 import sys
 from collections import Counter, defaultdict
+from functools import lru_cache
 
 # testray_helpers first: it puts utils/ on sys.path, which the plain-name
 # imports below (and build_health's own imports) rely on, same as the
@@ -90,6 +91,7 @@ def _routine_for_labels(labels):
     return None
 
 
+@lru_cache(maxsize=None)
 def _latest_build_index(routine_id):
     """name -> (case_id, status, error) for the routine's latest DONE build."""
     build = _get_latest_done_build(get_routine_to_builds(routine_id), quiet=True)

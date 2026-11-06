@@ -1,0 +1,131 @@
+---
+name: routine-triage
+description: Use when the user invokes /routine-triage or asks to run the Testray routine analysis and triage what it produced — "lancia lo script di analisi", "fai girare l'analisi dei test", "triage dei ticket di routine", "analizza i ticket aperti dalla run". Runs ./run_local.sh --live, stops on a build the CI broke and helps decide abandon/force, reads the run log step by step, then gives every new or changed routine ticket a verdict (product bug, test to fix, flaky, duplicate, CI failure) with evidence, and applies on Jira only the actions the user approves.
+---
+
+# /routine-triage — run the routine analysis and triage its tickets
+
+The analyzer (`analyze_testray_results.py`, via `run_local.sh`) does the mechanical part: groups failures, dedups by text, opens and closes tickets. What is left to a human is judgment: is this failure a product bug, a test to fix, a flaky test, a duplicate with a different text, or the CI? This skill does that judgment on the evidence `triage_context.py` gathers, and leaves every Jira write to the user's approval.
+
+Talk to the user in Italian, plain and short. Slack text and Jira comments in English.
+
+## Guardrails
+
+- `--live` writes to Jira and Testray: that is the normal flow (the workflow is script-driven, see README), so this skill runs it. `--force` and `--abandon` are decisions: never pass them without the user's explicit choice.
+- Never close, link or comment a ticket without approval. Propose, wait, then do exactly the approved list.
+- A verdict without evidence is not a verdict: every one cites what supports it (history line, error text, commit, similar ticket). If the evidence is thin, say "incerto" and what is missing.
+- If the triage shows a gap in the script (e.g. a group of duplicates the dedup missed), propose a script change; do not make it inside this skill. Script changes follow README "Changing the scripts".
+
+## Step 1 — Is there something to analyze?
+
+```bash
+cd scripts/python   # if not already there
+./run_local.sh --inspect
+ls -t logs/*-live.log | head -3
+```
+
+Report the newest DONE build per routine (id, date). If a live log already names those build ids (`grep -l <id> logs/*-live.log`), they were analyzed: tell the user and stop unless asked to re-triage (then go to Step 4 with that log). Otherwise go on; the run itself also exits early with "No new build since task … was completed" when there is nothing new.
+
+## Step 2 — Run
+
+```bash
+./run_local.sh --live
+```
+
+It takes several minutes: run it with a long timeout (or in background and wait for it). The first lines print `📝 Log: logs/run-…-live.log`: that file is the input of the next steps.
+
+## Step 3 — Build stopped by the build check?
+
+Look for `⛔` lines (also repeated after the recap). For each stopped routine:
+
+```bash
+./run_local.sh --triage build <routine>        # routine: commerce | user_management
+```
+
+Judge HOW the build fails:
+
+- **CI broken**: most not-passed results under a few errors, most of them CI/harness ("results with a CI/harness error" close to "Not passed"), e.g. "The build failed prior to running the test", Poshi batch rows with the docker console tail, "Unable to run on CI". Case: run 9957 (2026-11-03), 468 of 481 Commerce results CI.
+- **Real regression**: many tests but under product errors (assertions, locators, exceptions in product code); often the same count again in the next build. Case: UM 2026-10-07/08, 147-148 twice in a row.
+- **Mixed**: say so, with the numbers.
+
+Give a recommendation and ask with AskUserQuestion: abandon (recommended for CI) / force (recommended for a regression) / stop and look by hand. Then rerun only that routine:
+
+```bash
+./run_local.sh --live --routine <routine> --abandon    # or --force
+```
+
+`--abandon` creates the task as ABANDONED, opens no ticket, closes a ticket only if all its tests PASSED in that build, runs the PR check, and prints a Slack recap that says the build was discarded. Hand that recap to the user (Step 8). After `--force` continue with Step 4 on the new log.
+
+## Step 4 — Read the log, in order
+
+From the live log, collect:
+
+| Line | Meaning |
+|---|---|
+| `✔ Created investigation task for subtask … : LPD-X` | new ticket |
+| `♻ Reopened discarded ticket LPD-X` | failing again after a Discarded close: likely flaky |
+| `♻ Reusing existing open ticket LPD-X` / `♻ Linking N result(s) … to LPD-X` | still failing, already tracked |
+| `✔ Reported N new test(s) on LPD-X` | the ticket now covers more tests: changed |
+| `Found N issues to close` + `Would close`/closure report | closed as not reproducible |
+| `Skipped result …`, `⚠ COMMERCE`/area flags | skipped rows, portal-log errors with no ticket |
+| `Tasks NOT completed` section | subtasks the script could not triage |
+
+Scope of the triage: **new + changed** (Created, Reopened, Reported new tests). List the other touched tickets by key only, without re-analyzing them. Tell the user the counts before going on.
+
+## Step 5 — Gather evidence
+
+```bash
+./run_local.sh --triage build <routine>          # once per routine: error clusters
+./run_local.sh --triage ticket LPD-A LPD-B ...   # the tickets in scope
+```
+
+Known gap: for Playwright specs (`modules/test/playwright/...`) the helper lists commits on the spec file only, not on the product app. Query the app by hand when the verdict depends on it (e.g. `roles-admin-web` → `modules/apps/roles`), with `get_commits_for_path` from `utils/github_api.py` and the range dates the helper prints.
+
+Look across tickets, not only one by one: tickets whose tests went red in the same range with the same error family (e.g. 2026-11-06: LPD-113261, LPD-113264, LPD-111085, LPD-111078, all on a modal `iframe` locator after LPD-110897 changed how commerce dialogs open) are one cause, to be handled once.
+
+## Step 6 — Verdict per ticket
+
+One of:
+
+- **CI / infrastructure → chiudibile**: CI/harness error (see patterns in `triage_context.py`), network errors against the CI host (`net::ERR_…` on `http://i-…:8080`), or the test already PASSED in the latest build with no product change in between.
+- **Test fragile**: history alternates (≥2 pass/fail flips in 12), no commit on the test file or app explains it, often reopened tickets.
+- **Doppione di LPD-Y**: same test, or same error family (same locator up to a small variation, same exception) as another ticket, or same error cluster in `--triage build`; name the ticket to keep (the oldest still open, or the one someone is working on).
+- **Test da sistemare**: a commit in the range changed the UI/API the test relies on on purpose (renamed label, moved element, removed command); cite the commit.
+- **Bug probabile**: the test checks behavior and a commit in the app changed that behavior without changing the test; cite the commit and what it touches.
+- **Incerto**: say what is missing (e.g. range too wide, commit outside the app folder, no history).
+
+Each verdict: one line of conclusion, 1-3 evidence lines, confidence (alta / media / bassa), proposed action.
+
+## Step 7 — Report and approval
+
+Write the report in Italian, grouped by verdict, most actionable first (closable, duplicates), then the rest. Then a numbered action list, e.g.:
+
+1. Chiudere LPD-X (CI): commento "…"
+2. Collegare LPD-Y come doppione di LPD-Z e chiuderlo
+3. Commentare LPD-W con il commit sospetto abc123 (LPD-…)
+
+Ask which to apply (the user answers with numbers, "tutte", or edits). Apply only those:
+
+```bash
+set -a && source .env && set +a && DRY_RUN=false uv run python -c "
+import sys; sys.path.insert(0, 'utils')
+from jira_helpers import close_issue, add_comment, _jira
+# close (Discarded), keeps the parent/sub-task rules of the analyzer:
+print(close_issue('LPD-X', '<sha of the latest build>', comment='Closed. Not reproducible in SHA <sha>: <reason>'))
+# duplicate: link, then close with a comment naming the kept ticket:
+_jira().create_issue_link('Duplicate', 'LPD-Y', 'LPD-Z')
+print(close_issue('LPD-Y', '<sha>', comment='Closed. Not reproducible in SHA <sha>: duplicate of LPD-Z'))
+# comment:
+add_comment('LPD-W', '<text>')
+"
+```
+
+Keep the "Closed. Not reproducible in SHA" prefix: `diagnose_closed_commerce_tickets.py` parses it. Before the first duplicate link in a session, check the link type name exists (`[t.name for t in _jira().issue_link_types()]`). `close_issue` leaves alone tickets in progress or with active sub-tasks: report those instead of forcing them.
+
+## Step 8 — Slack
+
+Give the user the recap block from the log (between "Plain-text summary (copy-paste below)" and the closing dashes) unchanged: the user reads and edits it before posting. Offer, as a separate block, a short English "Triage" addendum: one line per verdict group with the ticket keys, plus the actions applied.
+
+## Step 9 — Close
+
+One line on what changed on Jira. If the triage showed something the script should catch by itself (a missed duplicate group, a CI error pattern opening tickets), propose it as a script change with the case that shows it.
