@@ -56,6 +56,7 @@ from testray_api import (
     LIFERAY_PORTAL_PROJECT_ID,
 )
 from github_api import get_compare, get_file_content, is_ancestor
+from build_health import assess_build, format_health
 
 # Modes for `check_pr_failures_for_routine`. They differ along two axes:
 #
@@ -248,6 +249,7 @@ def format_pr_check_block(routine, results):
         if build_url:
             meta_parts.append(f"{routine_name} build {build_id}: {build_url}")
         lines.append(ticket_line + " - " + " | ".join(meta_parts))
+        lines.extend(_out_of_scale_warning(r.get("routine_id"), build_id))
 
         # One line per test file with its counts. When the diff maps to
         # tests, the tests the PR changed come first with any status (the
@@ -298,6 +300,30 @@ def format_pr_check_block(routine, results):
 
     lines.append("")
     return lines
+
+
+def _out_of_scale_warning(routine_id, build_id):
+    """A warning line when the build the check read was broken by the CI.
+
+    On 2026-11-03 the Acceptance build had 3255 failed tests against ~700
+    on a normal day (utils/build_health.py): a PR's test FAILED there says
+    nothing about the PR. The check still reports the statuses, since some
+    tests did run, and this line tells the reader not to trust the failures.
+    A missing measure (build too old for the metrics list) prints nothing.
+    """
+    if not routine_id or not build_id:
+        return []
+    try:
+        health = assess_build(routine_id, build_id)
+    except Exception as e:
+        print(f"  (could not measure build {build_id}: {e})")
+        return []
+    if not health or not health["out_of_scale"]:
+        return []
+    return [
+        f"    ⚠ This build is out of scale ({format_health(health)}): "
+        "failures may come from the CI, not from the PR."
+    ]
 
 
 def print_pr_check_standalone(pr_check_by_routine):

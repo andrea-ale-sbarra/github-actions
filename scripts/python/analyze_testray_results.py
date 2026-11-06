@@ -45,3 +45,15 @@ if __name__ == "__main__":
         burndown_lines = None
 
     print_slack_summary(routine_runs, pr_check_by_routine_id, burndown_lines)
+
+    # Routines stopped by the build check (utils/build_health.py) are left out
+    # of the recap: a human has to decide first. Repeated here, after the
+    # recap, so the decision is not lost in the scroll.
+    for routine, _task_id, summary, _cleanup in routine_runs:
+        if summary and summary.get("blocked"):
+            key = routine["name"].lower().replace(" ", "_")
+            print(
+                f"\n⛔ {routine['name']}: build {summary['build_id']} NOT analyzed "
+                f"(out of scale). Rerun with --routine {key} --abandon or "
+                f"--routine {key} --force."
+            )

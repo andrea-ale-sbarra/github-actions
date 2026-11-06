@@ -29,6 +29,12 @@ With no flags, `./run_local.sh` runs the main analyzer (`analyze_testray_results
 | `--live` | Disables DRY_RUN: actually applies changes to Jira and Testray |
 | `--resume` | Resumes the most recent analysis task instead of starting from the newest build |
 | `--routine <name\|id>` | Restricts the analysis to a single routine (e.g. `--routine user_management`). If omitted, it runs on all of them |
+| `--force` | Analyzes a build even when the build check finds it out of scale (see below). Use it with `--routine` |
+| `--abandon` | Discards the latest build instead of analyzing it: task marked ABANDONED, no ticket opened, open tickets closed only when every test they list PASSED in that build, PR check still run, Slack message says the build was discarded. Use it with `--routine` |
+
+### Build check
+
+Before creating the task of a new build, the analyzer compares the results not passed with the median of the previous 10 builds of the routine (`utils/build_health.py`). At 5x the median and at least 50 more (2.5x for Acceptance, used only by the PR check), the build is out of scale: the routine is not analyzed, in dry run too, and the run prints the numbers and the two ways on: `--routine <r> --abandon` or `--routine <r> --force`. Case behind it: run 9957 of 2026-11-03, broken by the CI (Commerce 481 not passed against ~45). Look at how the build fails before choosing: a real regression can also be out of scale (UM 2026-10-07/08). The PR check prints a warning under a ticket whose build is out of scale.
 
 ### Diagnostic sub-commands
 
@@ -94,6 +100,7 @@ These replace the main analyzer, they don't run alongside it.
 - **`testray_helpers.py`** — high-level logic: routine selection (`select_routines`), testflow analysis (`analyze_testflow`), AFT report, Slack recap, closures report, priority ladder (`_PRIORITY_LADDER`).
 - **`jira_helpers.py`** — Jira wrapper (issue create/update/close, comment and label management).
 - **`github_api.py`** — minimal read-only wrapper around the GitHub REST API. The PR review check uses the `compare/{base}...{head}` endpoint and, to map the diff to tests, the `contents` endpoint at the merge HEAD.
+- **`build_health.py`** — build check: is a build out of scale compared with the previous builds of its routine (thresholds and the builds they were checked on are in the module docstring).
 - **`pr_check.py`** — PR review check logic: parses the final reviewer's "View total diff" link out of the Jira comments on a `check_label`-tagged ticket, fetches the changed files via GitHub compare, matches touched test files against case results in the matching Acceptance build, and produces the Slack-ready block consumed by both the main run and the standalone script.
 
 ## Run modes

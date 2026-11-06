@@ -39,9 +39,15 @@ def _is_selected_for_development(status_name):
     return norm(status_name or "") == norm("Selected for Development")
 
 
-def close_issue(issue_key, build_hash):
+def close_issue(issue_key, build_hash, comment=None):
     """
     Close a routine investigation ticket as Discarded ("not reproducible").
+
+    `comment` replaces the default closing comment on the parent ("Closed.
+    Not reproducible in SHA <hash>"). The closure on a discarded build uses
+    it to say the evidence is "every test of the ticket passed" in a build
+    the CI broke; it keeps the "Not reproducible in SHA <hash>" prefix
+    because diagnose_closed_commerce_tickets.py parses it.
 
     Flow:
     1. Load parent.
@@ -189,7 +195,9 @@ def close_issue(issue_key, build_hash):
                 transition=close_transition["id"],
                 resolution={"name": "Discarded"},
             )
-            jira.add_comment(issue_key, f"Closed. Not reproducible in SHA {build_hash}")
+            jira.add_comment(
+                issue_key, comment or f"Closed. Not reproducible in SHA {build_hash}"
+            )
             print(
                 f"✔ {issue_key} → '{close_transition['name']}' with "
                 f"'Discarded' (direct from '{current_status}')"

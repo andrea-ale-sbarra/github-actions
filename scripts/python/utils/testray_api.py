@@ -132,6 +132,25 @@ def complete_task(task_id):
     return response.json()
 
 
+def abandon_task(task_id):
+    """Mark a task ABANDONED: the build was discarded (CI broken), not analyzed.
+
+    The analyzer already skips a build whose task is ABANDONED
+    (`_prepare_task`), so the next runs do not pick the discarded build up
+    again, and the team sees on Testray that it was discarded on purpose.
+    """
+    if os.getenv("DRY_RUN", "false").lower() == "true":
+        print(f"[DRY RUN] Would abandon task {task_id} → {testray_task_url(task_id)}")
+        return {}
+    url = f"{BASE_URL}/tasks/{task_id}"
+    payload = {"dueStatus": {"key": "ABANDONED", "name": "Abandoned"}}
+    response = _request_with_auth_retry(
+        "PATCH", url, json=payload, headers={"Content-Type": "application/json"}
+    )
+    _raise_for_status(response, f"abandoning task {task_id}")
+    return response.json()
+
+
 def create_task(build):
     """Create a task for a build."""
     if os.getenv("DRY_RUN", "false").lower() == "true":

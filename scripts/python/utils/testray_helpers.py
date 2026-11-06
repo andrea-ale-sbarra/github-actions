@@ -57,7 +57,9 @@ from testray_api import (
     testray_build_url,
     get_case_type_name,
     get_routine_to_builds,
+    abandon_task,
 )
+from build_health import assess_build, format_health
 
 
 ANALYZED_ROUTINES = (
@@ -180,6 +182,12 @@ def analyze_testflow(builds, routine_id):
         if not latest_build:
             return None, None, None
 
+        gate = _check_build_before_analysis(latest_build)
+        if gate == "blocked":
+            return None, {"blocked": True, **_LAST_HEALTH[routine_id]}, None
+        if gate == "abandon":
+            return _abandon_build(latest_build)
+
         task_id, latest_build_id, complete_task_id = _prepare_task(latest_build)
 
         if not task_id and os.getenv("DRY_RUN", "false").lower() == "true":
@@ -277,7 +285,26 @@ def print_slack_summary(
     section1 = []
     for entry in active_runs:
         routine, task_id = entry[0], entry[1]
-        section1.extend(_format_routine_block(routine, task_id))
+        summary = entry[2] if len(entry) > 2 else None
+        discarded = summary if summary and summary.get("abandoned") else None
+        section1.extend(_format_routine_block(routine, task_id, discarded))
+
+    # A discarded build (--abandon) gets its own opening: the usual one says
+    # the analysis ran and new tickets are ready, which is not true then.
+    discarded_runs = [
+        e for e in active_runs if len(e) > 2 and e[2] and e[2].get("abandoned")
+    ]
+    if len(discarded_runs) == len(active_runs):
+        intro = (
+            "The latest routine builds were discarded because of CI issues, "
+            "so no analysis was done and no new tickets were opened. Tickets "
+            "were closed only where every test they track ran and passed."
+        )
+    else:
+        intro = (
+            "The routine test analysis run just finished and the "
+            "investigation tickets are ready for review."
+        )
 
     section2 = [
         "A quick suggestion: have a look to check that recent PRs aren't "
@@ -311,8 +338,7 @@ def print_slack_summary(
     lines = [
         "Hi all,",
         "",
-        "The routine test analysis run just finished and the "
-        "investigation tickets are ready for review.",
+        intro,
         "",
         *section1,
         *section2,
@@ -335,14 +361,35 @@ def print_slack_summary(
     print(separator)
 
 
-def _format_routine_block(routine, task_id):
-    """Build the lines that describe one routine inside the summary."""
+def _format_routine_block(routine, task_id, discarded=None):
+    """Build the lines that describe one routine inside the summary.
+
+    `discarded` is the closure summary of a build discarded with --abandon:
+    the task link is replaced by the build link (an abandoned task has no
+    testflow to open) and by what was done instead of the analysis.
+    """
     routine_label = routine["routine_label"]
-    testray_url = f"https://testray.liferay.com/web/testray#/testflow/{task_id}"
-    lines = [
-        f"{routine['name']}",
-        f"Testray analysis task: {testray_url}",
-    ]
+    if discarded:
+        build_id = discarded["build_id"]
+        lines = [
+            f"{routine['name']}",
+            f"Build discarded, not analyzed: "
+            f"{testray_build_url(build_id, routine['id'])}",
+        ]
+        if "not_passed" in discarded:
+            lines.append(f"Reason: {format_health(discarded)}.")
+        lines.append(
+            f"Tickets closed because all their tests passed in this build: "
+            f"{len(discarded.get('closed', []))} (listed below). Left open "
+            f"because their tests did not run or did not pass: "
+            f"{len(discarded.get('not_provable', []))}."
+        )
+    else:
+        testray_url = f"https://testray.liferay.com/web/testray#/testflow/{task_id}"
+        lines = [
+            f"{routine['name']}",
+            f"Testray analysis task: {testray_url}",
+        ]
 
     components = routine.get("components") or ()
     if components:
@@ -843,6 +890,238 @@ def get_acceptance_build_id_for_current_sha(current_sha):
         f"({latest_build.get('testrayBuildName')})"
     )
     return latest_build.get("testrayBuildId")
+
+
+# Health of the build each routine checked in this run, by routine id: the
+# recap and the final "not analyzed" notice read it.
+_LAST_HEALTH = {}
+
+
+def _check_build_before_analysis(latest_build):
+    """
+    Decide whether the build can be analyzed. Returns "go", "blocked" or
+    "abandon".
+
+    Only a build with no task yet is checked: a task already there means the
+    analysis was started (or --resume picked it), and stopping half-way would
+    leave it worse than finishing it.
+
+    A build out of scale (see utils/build_health.py, case: run 9957 of
+    2026-11-03) stops the run for its routine, in dry run too, so the dry run
+    shows what --live would do. Two flags decide, set by a human or by the
+    routine-triage skill after looking at how the build fails:
+      --force    analyze it anyway (e.g. a real regression that breaks many
+                 tests, like UM on 2026-10-07/08);
+      --abandon  discard it: ABANDONED task, no tickets opened, closures
+                 only on positive evidence (see _abandon_build).
+    --abandon applies to the routine's build even when it is in scale: the
+    human may know about a CI incident the numbers do not show. Both flags
+    apply to every selected routine, so use them with --routine.
+    """
+    if get_build_tasks(latest_build["id"]):
+        if os.getenv("ABANDON", "false").lower() == "true":
+            print(
+                f"⚠ --abandon ignored: build {latest_build['id']} already has a "
+                "task (analysis started). Abandon it by hand on Testray if needed."
+            )
+        return "go"
+
+    abandon = os.getenv("ABANDON", "false").lower() == "true"
+    force = os.getenv("FORCE", "false").lower() == "true"
+
+    health = assess_build(_CURRENT_ROUTINE_ID, latest_build["id"])
+    if health is None:
+        print(
+            f"ℹ No health measure for build {latest_build['id']} "
+            "(not in the metrics list yet, or too few previous builds): not checked."
+        )
+        health = {"build_id": latest_build["id"], "out_of_scale": False}
+    else:
+        print(f"ℹ Build {latest_build['id']} health: {format_health(health)}")
+    health["build_name"] = latest_build.get("name")
+    _LAST_HEALTH[_CURRENT_ROUTINE_ID] = health
+
+    if abandon:
+        return "abandon"
+    if not health["out_of_scale"]:
+        return "go"
+    if force:
+        print("⚠ Build out of scale, analyzing it anyway (--force).")
+        return "go"
+
+    routine = _get_routine_config(_CURRENT_ROUTINE_ID) or {}
+    name = routine.get("name", str(_CURRENT_ROUTINE_ID)).lower().replace(" ", "_")
+    print(
+        f"⛔ Build {latest_build['id']} ({latest_build.get('name')}) is out of scale: "
+        f"{format_health(health)}. Not analyzed: it would open tickets for "
+        f"CI failures and close tickets whose tests did not run.\n"
+        f"   Look at how it fails, then rerun with\n"
+        f"     --routine {name} --abandon   to discard it (closes only tickets "
+        f"whose tests all passed), or\n"
+        f"     --routine {name} --force     to analyze it anyway."
+    )
+    return "blocked"
+
+
+def _abandon_build(latest_build):
+    """
+    Discard a build the CI broke: create its task and mark it ABANDONED, open
+    no ticket, and close only the open tickets whose tests ALL passed in it.
+
+    The normal closure rule (close what does not appear among the failures,
+    _close_stale_routine_tasks) is wrong on such a build: "does not appear"
+    there mostly means "did not run" (crashed shard, untested), so it would
+    close tickets still red. A test that ran and passed is valid evidence
+    even in a broken build: in build 560288074 (run 9957) 1405 of 1886
+    results passed.
+
+    No testflow is created: it only splits the failures into subtasks for
+    the analysis, which is not done. Returns the analyze_testflow triple,
+    with the closure summary flagged "abandoned" for the recap.
+    """
+    build_id = latest_build["id"]
+    health = _LAST_HEALTH.get(_CURRENT_ROUTINE_ID) or {"build_id": build_id}
+    print(f"🗑 Discarding build {build_id} ({latest_build.get('name')}): no analysis.")
+
+    task = create_task(latest_build)
+    abandon_task(task["id"])
+
+    summary = _close_tickets_passed_in_build(build_id, health)
+    summary.update({"abandoned": True, "task_id": task["id"], **health})
+    return task["id"], summary, None
+
+
+def _parse_iso_datetime(value):
+    """Timezone-aware datetime from Testray ("...Z") or Jira ("...-0800")
+    timestamps; None when missing or unreadable."""
+    try:
+        return datetime.fromisoformat(value) if value else None
+    except ValueError:
+        return None
+
+
+_TICKET_TEST_ROW_RE = re.compile(r"^\|(?!\|)\s*([^|]+?)\s*\|[^|]*\|[^|]*\|\s*$", re.M)
+_TICKET_NEW_TESTS_RE = re.compile(
+    r"now tracked by this ticket:\s*\n(.*?)(?:\nh3\. Error|\Z)", re.S
+)
+
+
+def _tests_listed_in_ticket(issue_text):
+    """
+    Test names a routine ticket tracks: the rows of the "|| Test Name ||"
+    table the script writes in the description, plus the "* name" lines of
+    the comments it adds when more tests fail with the same error
+    (_comment_new_tests_on_issues). A ticket written by hand or by an older
+    script has neither, returns an empty set and is never closed on a
+    discarded build.
+    """
+    tests = {m.group(1) for m in _TICKET_TEST_ROW_RE.finditer(issue_text)}
+    for block in _TICKET_NEW_TESTS_RE.findall(issue_text):
+        tests.update(
+            line[2:].strip() for line in block.splitlines() if line.startswith("* ")
+        )
+    tests.discard("")
+    return tests
+
+
+def _close_tickets_passed_in_build(build_id, health):
+    """
+    Close the routine's open tickets whose listed tests ALL passed in
+    `build_id`. A ticket stays open when it lists no test, when one of its
+    tests is not in the build, or when one did not pass (failed, untested,
+    blocked): on a broken build none of these says the test is green.
+
+    Same ticket scope as _close_stale_routine_tasks (routine label, no
+    test_fix / out-of-RC label, not done). Returns its summary shape plus
+    "not_provable": [(key, reason)].
+    """
+    summary = {
+        "build_id": build_id,
+        "build_hash": _get_current_build_hash(build_id),
+        "attempted": [],
+        "closed": [],
+        "skipped_sfd_no_subtasks": [],
+        "skipped_parent_active": [],
+        "not_provable": [],
+    }
+    routine = _get_routine_config(_CURRENT_ROUTINE_ID)
+    if not routine:
+        return summary
+
+    jql = (
+        f"labels in ('{routine['routine_label']}') "
+        f"AND labels not in ('test_fix', '{routine['out_rc_label']}') "
+        f"AND statusCategory != Done"
+    )
+    open_issues = get_all_issues(jql, fields=["key", "created"])
+    if not open_issues:
+        return summary
+
+    # A ticket opened after the build ran comes from a newer build where its
+    # test failed: a pass in this older build says nothing about it. Found
+    # checking this pass on build 560288074 (2026-11-03) on 2026-11-06: it
+    # would have closed LPD-114273..114281, opened that morning from build
+    # 561707196 (2026-11-05). --abandon always takes the latest build, so
+    # this should not happen in a normal run; it guards the edge cases
+    # (a build imported late, a manual call on an older build).
+    build_time = _parse_iso_datetime((get_build_info(build_id) or {}).get("dueDate"))
+    open_keys = []
+    for issue in sorted(open_issues, key=lambda i: i.key):
+        created = _parse_iso_datetime(getattr(issue.fields, "created", None))
+        if build_time and created and created > build_time:
+            summary["not_provable"].append((issue.key, "opened after this build"))
+        else:
+            open_keys.append(issue.key)
+
+    status_by_test = {}
+    for result in get_all_build_case_results(build_id, include_case=True):
+        name = (result.get("r_caseToCaseResult_c_case") or {}).get("name")
+        status = (result.get("dueStatus") or {}).get("key") or "UNTESTED"
+        if name:
+            status_by_test.setdefault(name, set()).add(status)
+
+    build_url = testray_build_url(build_id, _CURRENT_ROUTINE_ID)
+    health_text = format_health(health) if "not_passed" in health else "CI issues"
+
+    for key in open_keys:
+        tests = _tests_listed_in_ticket(get_issue_text(key))
+        if not tests:
+            summary["not_provable"].append((key, "no test listed in the ticket"))
+            continue
+        missing = sorted(t for t in tests if t not in status_by_test)
+        not_passed = sorted(
+            t for t in tests if t in status_by_test and status_by_test[t] != {"PASSED"}
+        )
+        if missing or not_passed:
+            reason = (
+                f"{len(not_passed)} test(s) not passed" if not_passed
+                else f"{len(missing)} test(s) not in the build"
+            )
+            summary["not_provable"].append((key, reason))
+            continue
+
+        summary["attempted"].append(key)
+        comment = (
+            f"Closed. Not reproducible in SHA {summary['build_hash']}: every test "
+            f"of this ticket ({len(tests)}) passed in [Testray build {build_id}|"
+            f"{build_url}]. The build was discarded for CI issues ({health_text}), "
+            f"so tickets were closed only on tests that ran and passed."
+        )
+        result = close_issue(key, summary["build_hash"], comment=comment)
+        if result == CLOSE_OK:
+            summary["closed"].append(key)
+        elif result == CLOSE_SKIPPED_SFD_NO_SUBTASKS:
+            summary["skipped_sfd_no_subtasks"].append(key)
+        elif result == CLOSE_SKIPPED_PARENT_ACTIVE:
+            summary["skipped_parent_active"].append(key)
+
+    print(
+        f"ℹ Discarded build {build_id}: {len(summary['closed'])} ticket(s) closed "
+        f"(all tests passed), {len(summary['not_provable'])} left open (not provable)."
+    )
+    for key, reason in summary["not_provable"]:
+        print(f"   · {key} left open: {reason}")
+    return summary
 
 
 def _prepare_task(latest_build):

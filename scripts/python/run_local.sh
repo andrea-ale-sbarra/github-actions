@@ -37,12 +37,16 @@ fi
 # --- Parsing flag ---
 export DRY_RUN=true
 export RESUME=false
+export FORCE=false
+export ABANDON=false
 SUBCOMMAND=""
 BUILD_IDS=()
 
 while (( $# > 0 )); do
     case "$1" in
         --live) export DRY_RUN=false ;;
+        --force) export FORCE=true ;;
+        --abandon) export ABANDON=true ;;
         --resume) export RESUME=true ;;
         --priorities|--summary|--diagnose|--inspect|--check-pr-failures|--poshi-burndown) SUBCOMMAND="$1" ;;
         --routine) shift; export ROUTINE="$1" ;;
@@ -51,7 +55,7 @@ while (( $# > 0 )); do
         --build=*) SUBCOMMAND="--build"; BUILD_IDS+=("${1#--build=}") ;;
         *)
             echo "❌ Argomento non riconosciuto: $1"
-            echo "   Usa: --live | --resume | --routine <name|id> | --priorities | --summary | --inspect | --diagnose | --check-pr-failures | --poshi-burndown | --build <id>"
+            echo "   Usa: --live | --force | --abandon | --resume | --routine <name|id> | --priorities | --summary | --inspect | --diagnose | --check-pr-failures | --poshi-burndown | --build <id>"
             exit 1
             ;;
     esac
@@ -118,6 +122,12 @@ else
     echo "ℹ️ Modalità DRY RUN attiva (nessuna modifica verrà effettuata)."
     echo "   Usa './run_local.sh --live' per eseguire le modifiche reali."
     echo "   Usa './run_local.sh --priorities' per scoprire i nomi priorità validi su LPD."
+fi
+if [[ "$FORCE" == "true" ]]; then
+    echo "⚠️ --force: le build fuori scala vengono analizzate comunque."
+fi
+if [[ "$ABANDON" == "true" ]]; then
+    echo "🗑 --abandon: la build più recente delle routine selezionate viene scartata (task ABANDONED, nessun ticket aperto, chiusure solo con tutti i test PASSED)."
 fi
 if [[ "$RESUME" == "true" ]]; then
     echo "🔄 Modalità RESUME attiva: verrà ripreso il task in analisi più recente invece della build più nuova."
