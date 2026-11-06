@@ -34,6 +34,7 @@ import re
 import statistics
 import sys
 from collections import Counter, defaultdict
+from datetime import datetime, timedelta
 from functools import lru_cache
 
 # testray_helpers first: it puts utils/ on sys.path, which the plain-name
@@ -47,9 +48,16 @@ from utils.testray_helpers import (
     _tests_listed_in_ticket,
 )
 from build_health import assess_build, format_health
-from github_api import find_file_paths, get_commit_date, get_commits_for_path
-from jira_helpers import get_all_issues, get_issue_text, jira_issue_url
+from github_api import (
+    find_file_paths,
+    get_commit_date,
+    get_commits_for_path,
+    get_compare_commits,
+    is_ancestor,
+)
+from jira_helpers import _jira, get_all_issues, get_issue_text, jira_issue_url
 from testray_api import (
+    ACCEPTANCE_ROUTINE_ID,
     fetch_case_results,
     get_all_build_case_results,
     get_routine_to_builds,
@@ -93,7 +101,9 @@ def _routine_for_labels(labels):
 
 @lru_cache(maxsize=None)
 def _latest_build_index(routine_id):
-    """name -> (case_id, status, error) for the routine's latest DONE build."""
+    """name -> (case_id, status, error, result) for the routine's latest
+    DONE build, plus the build itself; the raw result is kept for its
+    attachments (batch axis, see _batch_mates)."""
     build = _get_latest_done_build(get_routine_to_builds(routine_id), quiet=True)
     index = {}
     for result in get_all_build_case_results(build["id"], include_case=True):
@@ -103,6 +113,7 @@ def _latest_build_index(routine_id):
                 result.get("r_caseToCaseResult_c_caseId"),
                 (result.get("dueStatus") or {}).get("key") or "UNTESTED",
                 result.get("errors") or "",
+                result,
             )
     return build, index
 
@@ -157,6 +168,8 @@ def ticket_report(key):
         print("Not a routine ticket (no routine label): stopping here.\n")
         return
 
+    _print_links_and_human_comments(key)
+
     errors = [e.strip() for e in _JIRA_CODE_BLOCK_RE.findall(text)]
     print("Errors in the ticket:")
     for e in dict.fromkeys(errors):
@@ -164,14 +177,18 @@ def ticket_report(key):
 
     tests = sorted(_tests_listed_in_ticket(text))
     build, index = _latest_build_index(routine["id"])
+    acceptance = []
     print(f"Tests tracked ({len(tests)}), status in latest {routine['name']} build {build['id']} ({build.get('name')}):")
     for t in tests:
-        case_id, status, error = index.get(t, (None, "NOT IN BUILD", ""))
+        case_id, status, error, result = index.get(t, (None, "NOT IN BUILD", "", None))
         print(f"  - {t}\n      now: {status}")
         if case_id:
             print(f"      history: {_history_line(case_id, routine['id'])}")
             if status != "PASSED" and error and error.strip() not in errors:
                 print(f"      current error differs from the ticket: {error[:300]}")
+            acceptance.append((t, case_id))
+            if "TEST_SETUP_ERROR" in error and result:
+                _print_batch_mates(build["id"], result, index)
 
     similar = _similar_tickets(key, routine, tests, errors)
     print(f"Other routine tickets with the same test or error ({len(similar)}):")
@@ -188,6 +205,7 @@ def ticket_report(key):
     if not since or not until:
         print("  Could not date the range: no commit list.\n")
         return
+    _print_acceptance_narrowing(owner, repo, base, head, acceptance, since, until)
     for scope, path in _scopes_for_tests(owner, repo, tests):
         commits = get_commits_for_path(owner, repo, path, head, since, until)
         print(f"  Commits touching the {scope} {path} ({len(commits)}):")
@@ -196,6 +214,144 @@ def ticket_report(key):
         if len(commits) > 40:
             print(f"    ... {len(commits) - 40} more")
     print()
+
+
+# Comments the analyzer writes by itself: left out of the "human comments"
+# list, which is there to show what people already know about the ticket.
+_SCRIPT_COMMENT_PREFIXES = (
+    "These tests are also failing in",
+    "Closed. Not reproducible",
+    "Reopened. Failing again",
+    "Closing sub-task",
+)
+
+
+def _print_links_and_human_comments(key):
+    """Links and the comments people wrote. On 2026-11-06 the first deep
+    triage of LPD-110849 missed that the ticket owner had already linked a
+    fix (LPD-113922, migration of the failing Poshi tests) and explained it
+    in a comment: what people know comes before any new analysis."""
+    issue = _jira().issue(key, fields="issuelinks,comment")
+    links = [
+        f"{l.type.outward if hasattr(l, 'outwardIssue') else l.type.inward} "
+        f"{(getattr(l, 'outwardIssue', None) or getattr(l, 'inwardIssue', None)).key}"
+        for l in issue.fields.issuelinks
+    ]
+    print(f"Links: {', '.join(links) if links else 'none'}")
+    comments = [
+        c for c in issue.fields.comment.comments
+        if not (c.body or "").lstrip().startswith(_SCRIPT_COMMENT_PREFIXES)
+    ]
+    print(f"Comments by people or earlier triage ({len(comments)}):")
+    for c in comments[-6:]:
+        body = " ".join((c.body or "").split())
+        print(f"  > {c.author.displayName} {c.created[:10]}: {body[:500]}")
+
+
+_TOOLING_COMMIT_RE = re.compile(
+    r"LRCI-|playwright|chromium|upgrade|bump|yarn|node\b|jdk|gradle", re.I
+)
+
+
+def _print_acceptance_narrowing(owner, repo, base, head, tests, since, until):
+    """Narrow the ticket's range with Acceptance, which runs daily on most
+    of the same tests: the newest Acceptance pass whose SHA lies between
+    the routine's last green and first red SHA becomes the new green end.
+
+    Case: LPD-114278/114279 (2026-11-06). The routine range b95e044c...
+    c638e9f9 held 707 commits; the tests passed in Acceptance at 35de5e4d,
+    which left ~10 hours and 390 commits, among them LRCI-8461 (Playwright
+    1.63 / Chromium 153), the cause. Commits already in a passing build
+    are ruled out. Tooling commits (Playwright, Chromium, upgrades, LRCI
+    test-fix sweeps) are listed first: they break tests of every app, so a
+    filter on the test's app never shows them."""
+    # Only Acceptance runs dated inside the range can hold a SHA inside it
+    # (with a day of margin for the build running after the commit): the
+    # others would cost a GitHub compare each, and an old base against a
+    # recent SHA can fail on GitHub's side (seen on LPD-111086).
+    first_day = since[:10]
+    last_day = (datetime.fromisoformat(until.replace("Z", "+00:00")) + timedelta(days=1)).date().isoformat()
+    best = None
+    for test, case_id in tests[:4]:
+        history = sorted(
+            fetch_case_results(case_id, ACCEPTANCE_ROUTINE_ID),
+            key=lambda h: h.get("executionDate") or "",
+            reverse=True,
+        )[:HISTORY_LENGTH]
+        letters = " ".join(f"{(h.get('executionDate') or '')[5:10]}:{(h.get('status') or '?')[0]}" for h in history)
+        print(f"  Acceptance history of {test[:70]}: {letters or 'not in Acceptance'}")
+        for h in history:
+            sha = h.get("gitHash")
+            day = (h.get("executionDate") or "")[:10]
+            if h.get("status") != "PASSED" or not sha or sha == base or not first_day <= day <= last_day:
+                continue
+            try:
+                inside = is_ancestor(owner, repo, base, sha) and is_ancestor(owner, repo, sha, head)
+                if inside and (best is None or is_ancestor(owner, repo, best, sha)):
+                    best = sha
+            except Exception as e:
+                print(f"  (could not place Acceptance SHA {sha[:12]} in the range: {e})")
+                continue
+            if inside:
+                break
+    if not best:
+        print("  No Acceptance pass inside the range: it cannot be narrowed.")
+        return
+    compare = get_compare_commits(owner, repo, best, head)
+    commits = compare["commits"]
+    print(
+        f"  Narrowed range (Acceptance pass): {best[:12]}...{head[:12]}, "
+        f"{compare['total_commits']} commits"
+        f"{' (GitHub listed only the first 250)' if compare['total_commits'] > len(commits) else ''}"
+    )
+    tooling = [c for c in commits if _TOOLING_COMMIT_RE.search(c["message"])]
+    print(f"  Tooling / test-infra commits in it ({len(tooling)}):")
+    for c in tooling[:30]:
+        print(f"    {c['sha'][:10]} {c['author']}: {c['message'][:110]}")
+
+
+_BATCH_AXIS_RE = re.compile(r"/\d+/((?:functional|modules-integration)[^/]*/\d+/\d+)/")
+
+
+def _batch_axis(result):
+    import json
+
+    attachments = result.get("attachments")
+    if isinstance(attachments, str):
+        attachments = json.loads(attachments)
+    for a in attachments or []:
+        m = _BATCH_AXIS_RE.search(a.get("url") or a.get("value") or "")
+        if m:
+            return m.group(1)
+    return None
+
+
+def _print_batch_mates(build_id, result, index):
+    """For a set-up error, the other results of the same batch axis and the
+    one right before the failing test (result ids follow the run order of
+    the axis). A set-up error is usually the victim of the previous test:
+    on 2026-11-06, the 4 "Unable to delete the portal instances" failures
+    of the last builds each followed the same test of their batch."""
+    axis = _batch_axis(result)
+    if not axis:
+        return
+    mates = sorted(
+        (r for (_c, _s, _e, r) in index.values() if _batch_axis(r) == axis),
+        key=lambda r: r["id"],
+    )
+    names = [(r.get("r_caseToCaseResult_c_case") or {}).get("name") for r in mates]
+    position = next((i for i, r in enumerate(mates) if r["id"] == result["id"]), None)
+    print(f"      batch {axis} of build {build_id}: {len(mates)} results")
+    if position:
+        previous = mates[position - 1]
+        print(
+            f"      ran right before: {names[position - 1]} "
+            f"[{(previous.get('dueStatus') or {}).get('key')}]"
+        )
+    for r, n in zip(mates, names):
+        status = (r.get("dueStatus") or {}).get("key")
+        if status != "PASSED" and r["id"] != result["id"]:
+            print(f"      also not passed in the batch: {n} [{status}] {(r.get('errors') or '')[:120]}")
 
 
 def _test_file_name(test_name):

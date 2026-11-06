@@ -84,6 +84,8 @@ Known gap: for Playwright specs (`modules/test/playwright/...`) the helper lists
 
 Look across tickets, not only one by one: tickets whose tests went red in the same range with the same error family (e.g. 2026-11-06: LPD-113261, LPD-113264, LPD-111085, LPD-111078, all on a modal `iframe` locator after LPD-110897 changed how commerce dialogs open) are one cause, to be handled once.
 
+`--triage ticket` already prints, per ticket: links and human comments (read them first: the owner may already have a plan, e.g. LPD-110849 → migration LPD-108800 / LPD-113922), the Acceptance history and the range narrowed with it (tooling commits first), and for a set-up error the test that ran right before in the batch. The steps below go further than the helper.
+
 ### Go deep: no token budget
 
 A verdict from the helper output alone is shallow (2026-11-06: the first pass read only history and commit lists and called four tickets "uncertain" or "CI"; the deep pass found the cause of three). For every ticket in scope, before giving a verdict:

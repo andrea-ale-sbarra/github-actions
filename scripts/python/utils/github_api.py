@@ -145,6 +145,24 @@ def get_commits_for_path(owner, repo, path, head, since, until, limit=100):
     ]
 
 
+def get_compare_commits(owner, repo, base, head):
+    """Commits of `base...head` as {sha, message, author}, oldest first, and
+    the total count. GitHub lists at most 250 commits: compare
+    `total_commits` with the list length to know whether it was cut."""
+    payload = _get_json(f"{GITHUB_API}/repos/{owner}/{repo}/compare/{base}...{head}") or {}
+    return {
+        "total_commits": payload.get("total_commits") or 0,
+        "commits": [
+            {
+                "sha": c.get("sha"),
+                "message": ((c.get("commit") or {}).get("message") or "").split("\n")[0],
+                "author": ((c.get("commit") or {}).get("author") or {}).get("name"),
+            }
+            for c in payload.get("commits") or []
+        ],
+    }
+
+
 def get_commit_date(owner, repo, sha):
     """Committer date (ISO 8601) of `sha`, or None."""
     return _get_commit_committer_date(owner, repo, sha)
