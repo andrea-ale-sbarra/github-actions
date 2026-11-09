@@ -1213,6 +1213,8 @@ def _normalize_error(error):
     # Collapse whitespace
     error = " ".join(error.strip().split())
 
+    error = _mask_ci_host(error)
+
     # Remove timestamps, memory addresses, test durations, or dynamic values
     error = re.sub(r"\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}", "", error)  # timestamps
     error = re.sub(r"0x[0-9A-Fa-f]+", "", error)  # memory addresses
@@ -1234,12 +1236,32 @@ def _normalize_error_keep_locator(error):
 
     error = " ".join(error.strip().split())
     error = _strip_playwright_error_noise(error)
+    error = _mask_ci_host(error)
     error = re.sub(r"\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}", "", error)
     error = re.sub(r"0x[0-9A-Fa-f]+", "", error)
     error = re.sub(r"\d+\s*(ms|s|seconds|minutes|m)\b", "", error)
     error = re.sub(r"\d{4,}", "#", error)
 
     return error
+
+
+_CI_HOST_RE = re.compile(r"\bi-[0-9a-f]{8,17}\b")
+
+
+def _mask_ci_host(error):
+    """Replace the CI host name (an EC2 instance id, "i-0af6460ccbccdaba5")
+    with "i-#".
+
+    Poshi set-up errors name the host, e.g. "Unable to delete the portal
+    instances i-0af6460ccbccdaba5. They survived deletion…", and the host
+    differs on every batch, so the same failure never matched the open
+    ticket: LPD-109383, 109582, 109861, 109862, 110849, 110850, 111086 and
+    114526 were all opened for it. Runs before the digit masking, which
+    would otherwise leave a different leftover per host ("i-0af#ccbccda").
+    The host inside a URL is already masked by
+    _strip_playwright_error_noise, for Playwright errors only.
+    """
+    return _CI_HOST_RE.sub("i-#", error)
 
 
 def _strip_playwright_error_noise(error):
@@ -2302,8 +2324,12 @@ def _find_existing_open_ticket_for_error(epic, case_names, errors):
     "Element is not present" ticket would look like the same error.
     Returns the existing issue key, or None.
     """
+    # Oldest first: when two open tickets match (a duplicate opened before
+    # this match worked, e.g. LPD-114526 next to LPD-110849), the new tests
+    # go to the ticket that tracks the failure, not to the duplicate.
     return _find_matching_routine_ticket(
-        epic, case_names, errors, "statusCategory != Done"
+        epic, case_names, errors, "statusCategory != Done",
+        order_by="created ASC",
     )
 
 
