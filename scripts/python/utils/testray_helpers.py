@@ -2797,6 +2797,69 @@ def _detect_test_type(case_type_name):
         return "unit"
     return None
 
+_JIRA_SUMMARY_MAX = 255
+
+
+def _summary_test_label(name):
+    """Short name of a test for a ticket title, or None for a row that is
+    not a test (a batch, a shard, "Top Level Build").
+
+    - Poshi "LocalFile.CommerceProductBundleRules#CanVerifyProductsLimitRule"
+      → "CommerceProductBundleRules#CanVerifyProductsLimitRule"
+    - Playwright "commerce/commerce-order-web/main/order.spec.ts > LPD-1 Title"
+      → "order.spec.ts > LPD-1 Title"
+    - Java "com.liferay.commerce.product.service.test.CPDefinitionTest"
+      → "CPDefinitionTest"
+    """
+    if not name or name == "N/A":
+        return None
+    first = name.split(" ")[0]
+    if re.search(r"/\d+/\d+$", first) or name == "Top Level Build" or (
+        " > " in name and ".spec." not in name
+    ):
+        return None
+    if name.startswith("LocalFile."):
+        return name[len("LocalFile."):]
+    if " > " in name:
+        path, _, title = name.partition(" > ")
+        return f"{path.rsplit('/', 1)[-1]} > {title}"
+    if re.match(r"^[a-z]+(\.[\w$]+)+(#\w+)?$", first):
+        return first.rsplit(".", 1)[-1]
+    return name
+
+
+def _build_ticket_summary(prefix, test_names, error):
+    """Title of a new routine ticket: the failing test first, the error after.
+
+    The title used to be "Investigate <error>", and for Poshi the error is a
+    locator: "Investigate Element is not present at
+    "//div[contains(@class,'modal-body')]//div[...]"" says what the browser
+    did not find, not which feature broke, and a list of such tickets cannot
+    be read without opening each one (Andrea, 2026-11-11, on LPD-114527 and
+    LPD-109686). The test name says the feature
+    ("CommerceProductBundleRules#CanVerifyProductsLimitRuleWithDecimalUOMQuantity").
+
+    Only the title changes. Dedup, the reopening of discarded tickets and
+    the --abandon closures read the description (the Test Name table and
+    the {code} errors), never the title, so they work the same on old and
+    new tickets. Rows that are not a test (batch or shard rows, a build
+    step) keep the old title: their name says nothing about a feature.
+    """
+    labels = [label for label in map(_summary_test_label, test_names) if label]
+    if not labels:
+        summary = f"{prefix}Investigate {error}"
+    else:
+        head = labels[0]
+        if len(labels) > 1:
+            head += f" (+{len(labels) - 1} more)"
+        # A Playwright error starts with "› spec.ts:line:col › test title":
+        # with the test already in front, keep only the "Error: …" part.
+        summary = f"{prefix}{head}: {_strip_playwright_error_noise(error)}"
+    if len(summary) > _JIRA_SUMMARY_MAX:
+        summary = summary[: _JIRA_SUMMARY_MAX - 3] + "..."
+    return summary
+
+
 def _create_investigation_task_for_subtask(
         acceptance_present,
         subtask_unique_failures,
@@ -2831,10 +2894,13 @@ def _create_investigation_task_for_subtask(
     rca_included = False
     component_name = None
     test_type = None
+    test_names = []
 
     for error, subtask_case_pairs in error_to_cases.items():
         if not first_error:
-            first_error = error[:200]
+            # Whole error: _build_ticket_summary cuts the title, and a
+            # Playwright error reaches its "Error:" part after ~150 chars.
+            first_error = error
 
         description_lines.append("h3. Error")
         description_lines.append(f"{{code}}{error}{{code}}")
@@ -2872,6 +2938,8 @@ def _create_investigation_task_for_subtask(
         description_lines.append("|| Test Name || Component || Duration ||")
         for name, duration, component in printed_rows:
             description_lines.append(f"| {name} | {component} | {duration} |")
+            if name not in test_names:
+                test_names.append(name)
 
         if not rca_included and batch_name and test_selector and github_compare:
             description_lines.extend(
@@ -2900,9 +2968,7 @@ def _create_investigation_task_for_subtask(
     summary_error = re.sub(
         r"^[\w.$]+(?:Exception|Error):\s*", "", " ".join(first_error.split())
     )
-    if len(summary_error) > 150:
-        summary_error = summary_error[:150] + "..."
-    summary = f"{prefix}Investigate {summary_error}"
+    summary = _build_ticket_summary(prefix, test_names, summary_error)
 
     description = "\n".join(description_lines + flow_intro)
 
