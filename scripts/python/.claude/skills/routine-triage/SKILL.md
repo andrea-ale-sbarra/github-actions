@@ -9,11 +9,18 @@ The analyzer (`analyze_testray_results.py`, via `run_local.sh`) does the mechani
 
 Talk to the user in Italian, plain and short. Slack text and Jira comments in English.
 
+In the chat, name every ticket by what it is about, not by its key: one plain phrase on the feature and what goes wrong ("limite di quantità con unità di misura decimale: la finestra di avviso non compare dopo Submit"), the key only in parentheses at the end when the user needs it to click. The same for migration stories ("la migrazione delle regole dei bundle"). A list of keys cannot be read without opening each ticket (Andrea, 2026-11-11: "non mi parlare con i ticket id che non capisco"). Jira comments and the Slack addendum keep the keys: there they are links.
+
 ## Guardrails
 
 - `--live` writes to Jira and Testray: that is the normal flow (the workflow is script-driven, see README), so this skill runs it. `--force` and `--abandon` are decisions: never pass them without the user's explicit choice.
 - Every analyzed ticket gets its triage written in a comment, without asking (Step 7): the analysis is only useful if whoever opens the ticket finds it there, not in a chat they never saw (2026-11-06: the punchout suspects of LPD-114276 were only in the chat). Closing and linking need approval: propose, wait, then do exactly the approved list.
-- Never edit the ticket description. The analyzer reads it as data: the "Test Name" table and the {code} errors drive dedup, the reopening of discarded tickets and the --abandon closures.
+- The ticket description and title may be rewritten when the triage finds connections (a common cause, more tests than the table lists, a fix that turns many tests green): whoever opens the ticket must see from the description how serious it is and what to do, not dig through comments (Andrea, 2026-11-11, on LPD-113264: 14 tests, 8 of them bundle rules, under a title that named one channel test's locator). Propose the rewrite with the other actions and apply it on approval. The analyzer reads the description as data, so the rewrite must not change what it reads:
+  - add a "h2. Triage summary (updated <date>)" section on top and keep the original text below it, unchanged: the "|| Test Name ||" table drives the closures, the {code} blocks the dedup and the reopening of discarded tickets;
+  - in the summary write no line shaped like a 3-cell table row ("| a | b | c |": read as a tracked test) and no {code} block (read as an error to match): use bullets and {{monospace}};
+  - test names in bullets are fine: dedup matches a ticket whose text contains the test name, which is what a grouped list wants;
+  - the title is never read by the scripts;
+  - before writing, check that `_tests_listed_in_ticket` and `_JIRA_CODE_BLOCK_RE.findall` give the same result on the old and new text (plus comments).
 - A verdict without evidence is not a verdict: every one cites what supports it (history line, error text, commit, similar ticket). If the evidence is thin, say "incerto" and what is missing.
 - If the triage shows a gap in the script (e.g. a group of duplicates the dedup missed), propose a script change; do not make it inside this skill. Script changes follow README "Changing the scripts".
 
@@ -132,6 +139,7 @@ Write the report in Italian, grouped by verdict, most actionable first (closable
 
 1. Chiudere LPD-X (CI): commento "…"
 2. Collegare LPD-Y come doppione di LPD-Z (resta aperto finché il test fallisce)
+3. Riscrivere titolo e descrizione di LPD-W: riassunto del triage in cima, testo originale sotto (see Guardrails)
 
 Ask which to apply (the user answers with numbers, "tutte", or edits). Apply only those:
 
