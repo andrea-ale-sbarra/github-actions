@@ -1516,8 +1516,19 @@ def _backfill_subtask_issues_if_needed(subtask_id, subtask, results):
         update_subtask_status(subtask_id, issues=_join_issues(issues))
 
 
+# The console tail Testray stores is cut at a fixed length, and where the
+# cut falls depends on how much the shard printed after the tests: in
+# build 566373083 (2026-11-15) the tail of shard 10/0 started at
+# "[exec] i-0153cfbc36e571634_playwright", after the "Stopping container"
+# line, so the row was not recognised and reopened LPD-112462 although its
+# only failing test (LPD-114274) ran in that shard. The container name on
+# an "[exec]" line is printed by the same docker stop step, so either form
+# names the shard's host. A test row starts with "› spec.ts:line:col" and
+# never carries that line. One capture group only: `_playwright_shard_host`
+# returns group(1).
 _PLAYWRIGHT_SHARD_HOST_RE = re.compile(
-    r"Stopping container \[ID: '\w+', name: '(i-[0-9a-f]+)_playwright'\]"
+    r"(?:Stopping container \[ID: '\w+', name: '|\[exec\]\s+)"
+    r"(i-[0-9a-f]+)_playwright\b"
 )
 
 
@@ -1527,7 +1538,8 @@ def _playwright_shard_host(error):
     A shard row (e.g. "playwright-js-tomcat101-postgresql163/10/0") fails
     whenever one of its tests fails, and its error is only the tail of the
     shard's console: "[exec] 54 passed (21.4m) [exec] Stopping container
-    [ID: '...', name: 'i-0434569b5f6be2037_playwright']".
+    [ID: '...', name: 'i-0434569b5f6be2037_playwright']", or a later part
+    of it: "[exec] i-0153cfbc36e571634_playwright [exec] ...".
     """
     match = _PLAYWRIGHT_SHARD_HOST_RE.search(error or "")
     return match.group(1) if match else None
