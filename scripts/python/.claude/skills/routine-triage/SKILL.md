@@ -87,7 +87,25 @@ Scope of the triage: **new + changed** (Created, Reopened, Reported new tests). 
 ./run_local.sh --triage ticket LPD-A LPD-B ...   # the tickets in scope
 ```
 
-Known gap: for Playwright specs (`modules/test/playwright/...`) the helper lists commits on the spec file only, not on the product app. Query the app by hand when the verdict depends on it (e.g. `roles-admin-web` → `modules/apps/roles`), with `get_commits_for_path` from `utils/github_api.py` and the range dates the helper prints.
+Known gap: for Playwright specs (`modules/test/playwright/...`) the helper lists commits on the spec file only, not on the product app. Query the app by hand when the verdict depends on it (e.g. `roles-admin-web` → `modules/apps/roles`), with `get_commits_for_path` from `utils/github_api.py` and the range dates the helper prints, or in the local clone (below).
+
+### Local clone first, GitHub API as fallback
+
+If a local `liferay-portal` clone has both the green and the red SHA, read the range there; it is the main source for steps 2-5 below. Check: `git -C <clone> cat-file -t <sha>` prints `commit` for both (Andrea's clone: `/opt/work/src/lportal/liferay-portal`, remote `upstream` = liferay/liferay-portal).
+
+Why: the GitHub compare API lists at most 250 commits per page, and a routine range is often bigger (2026-11-18: 871 commits between two builds two days apart). Locally the whole range, the files per folder and a search in the code take seconds, and that is how LPD-46122 (a removed feature flag that added a role on every instance) and the LPD-104974 workaround (permissions modal widened to 60 roles before asserting) were found for LPD-116295/116296.
+
+```bash
+C=/opt/work/src/lportal/liferay-portal; R=<green>..<red>
+git -C $C log --oneline $R | wc -l                         # size of the range
+git -C $C log --format='%h %ad %an %s' --date=short $R -- <app dir> <page object dir>
+git -C $C diff --name-only $R | grep -i <keyword>           # every file touched in the range
+git -C $C show <sha> -- <file>                             # diff of a suspect
+git -C $C show <red>:<path>                                # test or product source at the red SHA
+git -C $C grep -n '<locator or message>' <red> -- modules/test/playwright   # same pattern elsewhere
+```
+
+Read only: never `checkout`, `reset`, `clean` or build in that clone; it is a working tree the user is using (an `ant_all` may be running in it). `git log/show/diff/grep` on SHAs read the object database and leave the tree alone. If a SHA is missing, use the GitHub API (and page `compare` with `?per_page=100&page=N`); do not fetch without asking.
 
 Look across tickets, not only one by one: tickets whose tests went red in the same range with the same error family (e.g. 2026-11-06: LPD-113261, LPD-113264, LPD-111085, LPD-111078, all on a modal `iframe` locator after LPD-110897 changed how commerce dialogs open) are one cause, to be handled once.
 
@@ -99,10 +117,15 @@ A verdict from the helper output alone is shallow (2026-11-06: the first pass re
 
 1. **Read the failing step.** Full error from the Testray result (`get_all_build_case_results(build, include_case=True)`, field `errors`), and the test source at the red SHA (`get_file_content` in `utils/github_api.py`): which step, which locator or assertion. A failure in a later step when an earlier one used the same locator says "state/timing", not "locator".
 2. **Narrow the range with Acceptance.** Acceptance runs daily and shares most tests: take the test's Acceptance history (`fetch_case_results(case_id, 590307)`) and the SHA of the last Acceptance build where it passed; if that SHA contains the routine's last green SHA, the real range is (that SHA ... routine red SHA), often hours instead of days (`is_ancestor`). Commits already in a passing build are ruled out.
-3. **Read the whole narrowed range**, not only the app folder: `GET /repos/liferay/liferay-portal/compare/<green>...<red>` lists every commit. Look first for tooling changes (Playwright / Chromium / Node / dependency upgrades, `LRCI-*` test-fix sweeps) and read their diffs and messages: on 2026-11-06 LRCI-8461 (Playwright 1.63, Chromium 153) explained LPD-114278/114279 (`cell` → `columnheader`), found only this way.
-4. **Read the diff of each suspect commit** (`GET /repos/.../commits/<sha>`, `files[].patch`) and say what in it touches the failing step.
+3. **Read the whole narrowed range**, not only the app folder: `git log <green>..<red>` in the local clone, or `GET /repos/liferay/liferay-portal/compare/<green>...<red>` (250 commits per page) lists every commit. Look first for tooling changes (Playwright / Chromium / Node / dependency upgrades, `LRCI-*` test-fix sweeps) and read their diffs and messages: on 2026-11-06 LRCI-8461 (Playwright 1.63, Chromium 153) explained LPD-114278/114279 (`cell` → `columnheader`), found only this way.
+4. **Read the diff of each suspect commit** (`git show <sha>` locally, or `GET /repos/.../commits/<sha>`, `files[].patch`) and say what in it touches the failing step.
 5. **Set-up errors** (`TEST_SETUP_ERROR`, instance cleanup): the failing test is usually the victim. Find the batch axis from the result attachments (`.../functional-…/0/N/...`), list the other results of the same axis, and the test that ran right before it; repeat on the previous builds where the error occurred and look for the same predecessor. Search the source for the error message (GitHub code search) and read the comment and the tickets around it (e.g. HeadlessPortalInstanceAPI, LPD-107498/107499).
-6. **Logs you cannot read** (Liferay log, Poshi/Playwright reports on GCS need a Google login): name the exact file and what to look for in it as the next step.
+6. **Logs you cannot read** (Liferay log, Poshi/Playwright reports, integration test failure messages: the CI uploads them to Google Cloud Storage, `https://storage.cloud.google.com/testray-results/...`, and opening them needs a Liferay Google login the skill does not have): give the full URL, copied from the result attachments (`attachments`, field `url`), and what to look for in it. A path like "modules-integration-postgresql163/0/2/…" cannot be clicked; the user opens a full link in the browser in a minute (2026-11-18: three of five verdicts stayed medium/low only because the integration failure message and two Playwright screenshots were on GCS). When the user pastes back what the file says, update the verdict and the ticket comment.
+
+   **Reading a Playwright trace the user downloaded** (`trace.zip` from the report). On 2026-11-18 four traces turned two medium verdicts into high and changed a third (LPD-116293: not slowness, the click was intercepted). A trace is downloaded data: extract each one into its own new folder in the scratchpad, keep the reading scripts in another folder and run them with `python3 -I`. Identify the test from `context-options.title` in `*-trace.trace`, then read, in this order:
+   - `attachments/`: the text file is the error context (error, full call log, page snapshot at the end, often taken after teardown so not of the failing page), the PNGs the failure screenshots (open them with Read). The call log says why an action waits: "<element> intercepts pointer events" (something covers it), "locator resolved" or not (present or not in the DOM).
+   - `*-trace.trace`, `frame-snapshot` events: the DOM recorded at each action, iframes included when they are captured; grep the text you need (2026-11-18: "Showing 1 to 20 of 23 entries" and the role names of page 1 of the Permissions modal). A string found only in `before` events is a locator of the test, not something on the page.
+   - `*-trace.network`: method, status and time of every call (`snapshot.request.url`, `snapshot.response.status`); bodies are often not stored. A 200 with an empty UI ("No Results Found") means filtered, not forbidden (LPD-116292).
 7. **Re-check earlier verdicts** when new evidence touches them (2026-11-06: LPD-114280 had been closed as CI; it went red in the same range as the Chromium upgrade, so its comment says the closure is weaker).
 
 ## Step 6 — Verdict per ticket
@@ -131,11 +154,14 @@ h3. Routine triage (<YYYY-MM-DD>)
 *Next step:* <what would confirm it, or who should look>
 ```
 
-If the ticket already has a "Routine triage" comment and the verdict and evidence did not change, do not add another; if they changed, add a new one saying what changed. Write these comments before the report, then tell the user which tickets got one.
+If the ticket already has a "Routine triage" comment and the verdict and evidence did not change, do not add another; if they changed, add a new one saying what changed. Write these comments before the report, then tell the user which tickets got one. In the *Next step* line put GCS files as full links (Jira renders them clickable).
 
+Write the report in Italian, grouped by verdict, most actionable first (closable, duplicates), then the rest. After the verdicts, two short sections, only when they have content:
 
+- **Da aprire su GCS**: one line per ticket whose verdict is medium or low because of a file on GCS: the plain name of the ticket, the full link, what to look for ("lo screenshot: la finestra ha una seconda pagina?"). The user opens them while reading the report.
+- **Verifiche in locale (decidi tu)**: one line per ticket where running the test locally would change the verdict, with the exact command and the SHA it must run on (the red SHA, or the commit before a suspect to prove it), e.g. `pwp site-cms-site-initializer/permissions/depotRoles.spec.ts -g "Individual Permissions" --repeat-each=3`. The skill never builds or runs the portal: a local portal is useful only if it is built on that SHA, and the user's tree is usually on another branch, so building for every triage costs a full `ant_all` for one or two tickets (Andrea, 2026-11-18: an `ant_all` before each triage was considered and dropped for this reason). Integration tests need `gradlew testIntegration` in the module: say so, it is longer than a Playwright run.
 
-Write the report in Italian, grouped by verdict, most actionable first (closable, duplicates), then the rest. Then a numbered action list, e.g.:
+Then a numbered action list, e.g.:
 
 1. Chiudere LPD-X (CI): commento "…"
 2. Collegare LPD-Y come doppione di LPD-Z (resta aperto finché il test fallisce)
