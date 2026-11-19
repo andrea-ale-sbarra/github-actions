@@ -5,6 +5,7 @@ routine-triage skill (.claude/skills/routine-triage/), and by hand.
 
     triage_context.py ticket LPD-X [LPD-Y ...]
     triage_context.py build <routine> [<build id>]
+    triage_context.py acceptance [<build id>]
 
 `ticket` prints, for each ticket: status, labels, the error and the tests it
 tracks, each test's status in the routine's latest build and its recent
@@ -17,6 +18,10 @@ the test's file or its app.
 the not-passed results grouped by error with how many tests each error hits,
 and how many errors look like CI/harness failures. Many tests under a few CI
 errors point to a broken CI; many different errors point to regressions.
+
+`acceptance` prints, for every open routine ticket, the status of its tests
+in the latest DONE Acceptance build and their recent Acceptance history: the
+check to run when there is no new routine build (see acceptance_report).
 
 Why a script and not ad-hoc API calls from the skill: the data is gathered
 the same way on every run, and the skill only judges it. Nothing here
@@ -54,6 +59,7 @@ from github_api import (
     get_commits_for_path,
     get_compare_commits,
     is_ancestor,
+    search_open_prs,
 )
 from jira_helpers import _jira, get_all_issues, get_issue_text, jira_issue_url
 from testray_api import (
@@ -169,6 +175,7 @@ def ticket_report(key):
         return
 
     _print_links_and_human_comments(key)
+    _print_open_prs(key, sorted(_tests_listed_in_ticket(text)))
 
     errors = [e.strip() for e in _JIRA_CODE_BLOCK_RE.findall(text)]
     print("Errors in the ticket:")
@@ -246,6 +253,38 @@ def _print_links_and_human_comments(key):
     for c in comments[-6:]:
         body = " ".join((c.body or "").split())
         print(f"  > {c.author.displayName} {c.created[:10]}: {body[:500]}")
+
+
+# The team opens its PRs on this fork before they go to the main repo.
+_TEAM_PR_REPO = ("liferay-commerce", "liferay-portal")
+
+
+def _test_search_term(test_name):
+    """The part of a Testray test name a PR is likely to quote: the Poshi
+    command (after '#'), the Java class's simple name, the Playwright test
+    title (cut at a word, GitHub caps the whole query at 256 characters)."""
+    if "#" in test_name:
+        return test_name.split("#", 1)[1]
+    if " > " in test_name:
+        title = test_name.split(" > ", 1)[1]
+        return title if len(title) <= 70 else title[:70].rsplit(" ", 1)[0]
+    if re.fullmatch(r"com\.liferay(\.\w+)+", test_name):
+        return test_name.rsplit(".", 1)[-1]
+    return None
+
+
+def _print_open_prs(key, tests):
+    """Open PRs that name the ticket or one of its tests. A fix often comes
+    under another ticket: on 2026-11-19 the fix of LPD-114527 was PR
+    liferay-commerce#8503 (LPD-115317, migration of the test), which names
+    the Poshi test and not the routine ticket; the triage found it only by
+    searching the author's PRs by hand. Without it the triage would judge
+    a ticket someone is already closing."""
+    terms = [key] + [t for t in dict.fromkeys(_test_search_term(t) for t in tests) if t]
+    prs = search_open_prs(*_TEAM_PR_REPO, terms)
+    print(f"  Open PRs naming the ticket or a test ({len(prs)}):")
+    for pr in prs:
+        print(f"    #{pr['number']} {pr['author']}: {pr['title'][:100]} {pr['url']}")
 
 
 _TOOLING_COMMIT_RE = re.compile(
@@ -435,11 +474,118 @@ def build_report(routine_arg, build_id=None):
         print(f"  {len(names):4d}  {error}\n        e.g. {sample[:120]}")
 
 
+ACCEPTANCE_HISTORY_LENGTH = 6
+ACCEPTANCE_HISTORY_TESTS = 3
+
+
+def acceptance_report(build_id=None):
+    """The open routine tickets read against the latest Acceptance build.
+
+    The routines run every other day, Acceptance every day, and they share
+    most tests. On a day with no new routine build the triage used to stop;
+    on 2026-11-19 this check, done by hand on Acceptance 568532076 (464
+    commits ahead of the routines), showed in a few minutes: the fix of
+    LPD-116295 already green (LPD-116296 passed), the returns bug of
+    LPD-116292 pinned on LPD-46122 (11 passes in Acceptance before it, red
+    after), and LPD-116293 green in every Acceptance run (fragile in the
+    routine only).
+
+    What it does not do: close or comment. A green test in Acceptance is
+    not a green test in the routine (different batches, timings, and
+    LPD-114527 has been red in Commerce and green in Acceptance on the same
+    SHA); closures stay with the analyzer on the routine's own build. A
+    test missing from Acceptance (Poshi tests run only in the routine, AI
+    Hub tests skipped there) says nothing either way."""
+    builds = get_routine_to_builds(ACCEPTANCE_ROUTINE_ID)
+    if build_id is None:
+        # The newest Acceptance build is often still importing: take the
+        # newest DONE one rather than giving up like the analyzer does.
+        build = next(b for b in builds if (b.get("importStatus") or {}).get("key") == "DONE")
+    else:
+        build = next(b for b in builds if b["id"] == build_id)
+    acceptance_sha = build.get("gitHash") or ""
+    print(f"=== Acceptance build {build['id']} ({build.get('name')}) {testray_build_url(build['id'])}")
+    print(f"SHA {acceptance_sha[:12]}")
+
+    for routine in ANALYZED_ROUTINES:
+        latest = _get_latest_done_build(get_routine_to_builds(routine["id"]), quiet=True)
+        if not latest:
+            continue
+        routine_sha = latest.get("gitHash") or ""
+        try:
+            if is_ancestor("liferay", "liferay-portal", routine_sha, acceptance_sha):
+                ahead = get_compare_commits("liferay", "liferay-portal", routine_sha, acceptance_sha)["total_commits"]
+                where = f"Acceptance is {ahead} commits ahead"
+            else:
+                where = "Acceptance does NOT contain it: what follows says little about newer commits"
+        except Exception as e:
+            where = f"could not compare ({e})"
+        print(f"{routine['name']} latest build {latest['id']} SHA {routine_sha[:12]}: {where}")
+
+    index = {}
+    for result in get_all_build_case_results(build["id"], include_case=True):
+        name = (result.get("r_caseToCaseResult_c_case") or {}).get("name")
+        if name:
+            index[name] = result
+
+    labels = ", ".join(f'"{r["routine_label"]}"' for r in ANALYZED_ROUTINES)
+    issues = get_all_issues(
+        f"labels in ({labels}) AND statusCategory != Done ORDER BY key DESC",
+        fields=["summary", "status", "assignee"],
+    )
+    print(f"Open routine tickets: {len(issues)}\n")
+    for issue in issues:
+        text = get_issue_text(issue.key)
+        ticket_errors = {e.strip() for e in _JIRA_CODE_BLOCK_RE.findall(text)}
+        tests = sorted(_tests_listed_in_ticket(text))
+        found = {t: index[t] for t in tests if t in index}
+        statuses = Counter((r.get("dueStatus") or {}).get("key") or "UNTESTED" for r in found.values())
+        ran = {s for s in statuses if s != "UNTESTED"}
+        if not ran:
+            # LPD-99531: AI Hub tests are skipped in Acceptance too; an
+            # UNTESTED row is not a red test.
+            verdict = "not run in Acceptance: nothing to say"
+        elif ran == {"PASSED"} and len(found) == len(tests):
+            verdict = "GREEN in Acceptance: fix already on master, or red in the routine only"
+        elif ran == {"PASSED"}:
+            # LPD-114526: 1 of its 3 tests is in Acceptance; a green victim
+            # of a dirty instance does not say the instance is clean.
+            verdict = "green where present, the other tests are not in Acceptance"
+        elif "PASSED" in ran:
+            verdict = "partly green"
+        else:
+            verdict = "still red"
+        assignee = getattr(issue.fields.assignee, "displayName", None) or "unassigned"
+        print(f"{issue.key} [{issue.fields.status.name}, {assignee}] {issue.fields.summary[:110]}")
+        print(
+            f"  {verdict}; {len(found)} of {len(tests)} tracked tests in Acceptance"
+            f"{' (' + ', '.join(f'{k} {v}' for k, v in statuses.most_common()) + ')' if statuses else ''}"
+        )
+        for t, r in list(found.items())[:ACCEPTANCE_HISTORY_TESTS]:
+            status = (r.get("dueStatus") or {}).get("key") or "UNTESTED"
+            history = sorted(
+                fetch_case_results(r.get("r_caseToCaseResult_c_caseId"), ACCEPTANCE_ROUTINE_ID),
+                key=lambda h: h.get("executionDate") or "",
+                reverse=True,
+            )[:ACCEPTANCE_HISTORY_LENGTH]
+            # Dated letters, newest first: where a P turns into an F is the
+            # boundary to place against the suspect commit (LPD-116292).
+            line = " ".join(f"{(h.get('executionDate') or '')[5:10]}:{(h.get('status') or '?')[0]}" for h in history)
+            print(f"    {t[:100]}\n      {status}; Acceptance history {line}")
+            error = (r.get("errors") or "").strip()
+            if status != "PASSED" and error and error not in ticket_errors:
+                print(f"      error: {' '.join(error.split())[:200]}")
+        _print_open_prs(issue.key, tests)
+        print()
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "ticket":
         for k in sys.argv[2:]:
             ticket_report(k)
     elif len(sys.argv) >= 3 and sys.argv[1] == "build":
         build_report(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else None)
+    elif len(sys.argv) >= 2 and sys.argv[1] == "acceptance":
+        acceptance_report(int(sys.argv[2]) if len(sys.argv) > 2 else None)
     else:
         sys.exit(__doc__)

@@ -123,6 +123,41 @@ def find_file_paths(owner, repo, filename):
     return [i.get("path") for i in payload.get("items") or [] if i.get("path")]
 
 
+def search_open_prs(owner, repo, terms):
+    """Open PRs of owner/repo whose title or body contains any of `terms`
+    (GitHub issue search, needs GITHUB_TOKEN), as {number, author, title,
+    url}. Terms with spaces are quoted. GitHub caps a query at 256
+    characters and 5 OR operators: terms past either limit are dropped, so
+    callers pass the most specific first. Empty list when the search fails:
+    callers treat it as "none found", not as an error."""
+    from urllib.parse import quote_plus
+
+    query = f"repo:{owner}/{repo} is:pr is:open"
+    used = 0
+    for term in terms:
+        term = f'"{term}"' if " " in term else term
+        candidate = f"{query} {'OR ' if used else ''}{term}"
+        if used > 5 or len(candidate) > 256:
+            break
+        query, used = candidate, used + 1
+    if not used:
+        return []
+    try:
+        payload = _get_json(f"{GITHUB_API}/search/issues?per_page=10&q=" + quote_plus(query)) or {}
+    except RequestException as e:
+        print(f"⚠ GitHub PR search failed: {e}")
+        return []
+    return [
+        {
+            "number": i.get("number"),
+            "author": (i.get("user") or {}).get("login"),
+            "title": i.get("title"),
+            "url": i.get("html_url"),
+        }
+        for i in payload.get("items") or []
+    ]
+
+
 def get_commits_for_path(owner, repo, path, head, since, until, limit=100):
     """Commits reachable from `head` that touch `path` with a committer date
     in [since, until] (ISO 8601), newest first, as {sha, message, author}.

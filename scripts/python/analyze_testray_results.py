@@ -57,3 +57,19 @@ if __name__ == "__main__":
                 f"(out of scale). Rerun with --routine {key} --abandon or "
                 f"--routine {key} --force."
             )
+
+    # Open routine tickets against the latest Acceptance build, with the open
+    # PRs that name them (triage_context.acceptance_report). Read-only, after
+    # the recap so it never sits inside the Slack block, and on every run:
+    # on 2026-11-19, with no new routine build, it was what showed the
+    # LPD-116295 fix already green and the fix PRs of LPD-114527 and
+    # LPD-116292; run only on request (a --triage flag) it was skipped.
+    # Wrapped like the PR check: a Testray or GitHub hiccup here must not
+    # turn a finished analysis into a failed run.
+    try:
+        from triage_context import acceptance_report
+
+        print("\n=== Open routine tickets in the latest Acceptance build ===\n")
+        acceptance_report()
+    except Exception as e:
+        print(f"Acceptance check skipped: {e}")
