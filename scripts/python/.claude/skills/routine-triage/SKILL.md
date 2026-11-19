@@ -32,7 +32,17 @@ cd scripts/python   # if not already there
 ls -t logs/*-live.log | head -3
 ```
 
-Report the newest DONE build per routine (id, date). If a live log already names those build ids (`grep -l <id> logs/*-live.log`), they were analyzed: tell the user and stop unless asked to re-triage (then go to Step 4 with that log). Otherwise go on; the run itself also exits early with "No new build since task … was completed" when there is nothing new.
+Report the newest DONE build per routine (id, date). If a live log already names those build ids (`grep -l <id> logs/*-live.log`), they were analyzed: still go on to Step 2 (unless asked to re-triage: then go to Step 4 with that log). The run prints "No new build since task … was completed", opens and closes nothing, and still ends with the Acceptance section below, which is the triage of that day.
+
+### The Acceptance section of the log
+
+The routines run every other day, Acceptance every day on most of the same tests. Every run ends, after the Slack recap, with "=== Open routine tickets in the latest Acceptance build ===" (the same output as `./run_local.sh --triage acceptance`, which runs it alone). It prints how many commits the latest DONE Acceptance build is ahead of the routines, then for every open routine ticket: the status of its tests in that build, their dated Acceptance history, and the open PRs that name the ticket or one of its tests. Read it on every run, not only on days without a new build. Report, in plain Italian and grouped:
+
+- **green in Acceptance**: a fix already on master (cite the commit, found in the local clone between the routine SHA and the Acceptance SHA) or a test red in the routine only. The analyzer closes the ticket when the routine build shows it green: no action.
+- **a P that turned into an F in the history**: place the suspect commit between the two SHAs (2026-11-19: LPD-116292, 11 passes before LPD-46122, red after).
+- **an open PR**: say what it changes and whether it closes the ticket. A PR under another key (a migration that removes the Poshi test) leaves the routine ticket open: the analyzer cannot prove a test that is no longer in the build, so it is closed by hand after the merge (2026-11-19: LPD-114527 and PR #8503, LPD-115317).
+
+Write a "Routine triage" comment only where the evidence changed the verdict or its confidence (Step 7 rules). Never close or link on Acceptance alone: a test green in Acceptance can be red in the routine on the same SHA (LPD-114527). On a day with no new routine build this is the whole triage: then go to Step 9.
 
 ## Step 2 — Run
 
