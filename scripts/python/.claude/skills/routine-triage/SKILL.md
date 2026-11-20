@@ -72,6 +72,8 @@ Give a recommendation and ask with AskUserQuestion: abandon (recommended for CI)
 ./run_local.sh --live --routine <routine> --abandon    # or --force
 ```
 
+When every routine was stopped and the choice is the same for all, run once without `--routine` (`./run_local.sh --live --abandon`): one run, one Slack recap. One run per routine gives two near-identical recaps, each with the whole Poshi burndown, to merge by hand (2026-11-20, Commerce 569745445 and UM 569745185, both broken by the same portal start-up failure). Never drop `--routine` when only one routine was stopped: `--abandon` and `--force` apply to every selected routine, and `--abandon` discards a build even when it is in scale.
+
 `--abandon` creates the task as ABANDONED, opens no ticket, closes a ticket only if all its tests PASSED in that build, runs the PR check, and prints a Slack recap that says the build was discarded. Hand that recap to the user (Step 8). After `--force` continue with Step 4 on the new log.
 
 ## Step 4 — Read the log, in order
