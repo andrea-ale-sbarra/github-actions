@@ -44,7 +44,34 @@ if __name__ == "__main__":
         print(f"Poshi burndown skipped: {e}")
         burndown_lines = None
 
-    print_slack_summary(routine_runs, pr_check_by_routine_id, burndown_lines)
+    # Routines of other teams our tickets can break (TRIAGE_ROUTINES, the
+    # CMS since 2026-11-25), gathered once here: a few lines go into the
+    # recap (asked on 2026-11-26, the CMS check was being added by hand),
+    # the full section is printed after the Acceptance one from the same
+    # data. Read-only and wrapped: a Testray or GitHub hiccup must not lose
+    # the recap.
+    triage_data = []
+    triage_recap_lines = []
+    try:
+        from triage_context import (
+            format_triage_routine_recap_lines,
+            triage_routine_data,
+        )
+        from utils.testray_helpers import TRIAGE_ROUTINES
+
+        for routine in TRIAGE_ROUTINES:
+            data = triage_routine_data(routine["key"])
+            triage_data.append(data)
+            triage_recap_lines += format_triage_routine_recap_lines(data)
+    except Exception as e:
+        print(f"Triage routines check skipped: {e}")
+
+    print_slack_summary(
+        routine_runs,
+        pr_check_by_routine_id,
+        burndown_lines,
+        extra_section_lines=triage_recap_lines,
+    )
 
     # Routines stopped by the build check (utils/build_health.py) are not
     # analyzed: a human has to decide first. The recap lists them with their
@@ -75,16 +102,14 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Acceptance check skipped: {e}")
 
-    # Routines of other teams our tickets can break (TRIAGE_ROUTINES, the
-    # CMS since 2026-11-25): their latest build against our tickets merged
-    # where each test went red. Read-only, after the Acceptance section and
-    # for the same reason: read on every run, not only when asked.
+    # Their latest build against our tickets merged where each test went
+    # red, in full. After the Acceptance section and for the same reason:
+    # read on every run, not only when asked.
     try:
         from triage_context import triage_routine_report
-        from utils.testray_helpers import TRIAGE_ROUTINES
 
-        for routine in TRIAGE_ROUTINES:
-            print(f"\n=== {routine['name']} tests against our tickets ===\n")
-            triage_routine_report(routine["key"])
+        for data in triage_data:
+            print(f"\n=== {data['routine']['name']} tests against our tickets ===\n")
+            triage_routine_report(data["routine"]["key"], data=data)
     except Exception as e:
         print(f"Triage routines check skipped: {e}")

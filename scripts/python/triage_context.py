@@ -699,8 +699,9 @@ def _outside_dirs(files, our_words=("pim",)):
     return dirs
 
 
-def triage_routine_report(key, build_id=None):
-    """A routine of another team (TRIAGE_ROUTINES) read against our tickets.
+def triage_routine_data(key, build_id=None):
+    """What triage_routine_report prints, as data: a routine of another team
+    (TRIAGE_ROUTINES) read against our tickets.
 
     For each test not passed in its latest DONE build (CI/harness rows only
     counted): the history, the range where it went red, and the tickets of
@@ -710,28 +711,31 @@ def triage_routine_report(key, build_id=None):
     TasksSection FDS test, red on 11-19 and 11-22, had PIM merges in its
     range next to Frontend Data Set commits of other teams, LPD-117521 and
     LPD-116535). The folders a ticket touches outside our modules are what
-    to read first: a CMS test is reached through CMS code."""
+    to read first: a CMS test is reached through CMS code.
+
+    Split from the printing on 2026-11-26, when the same result went into
+    the Slack recap too (format_triage_routine_recap_lines): the recap is
+    printed before this section, and gathering twice would read the
+    histories and GitHub searches twice and could give two different
+    answers in one run."""
     routine = next(r for r in TRIAGE_ROUTINES if r["key"] == key)
+    data = {"routine": routine, "build": None, "health": None, "ci": [],
+            "product": [], "more": 0, "ranges": []}
     builds = get_routine_to_builds(routine["id"])
     if build_id is None:
         build = _get_latest_done_build(builds, quiet=True)
     else:
         build = next(b for b in builds if b["id"] == build_id)
     if not build:
-        print(f"No DONE {routine['name']} build.")
-        return
-    print(f"=== {routine['name']} build {build['id']} ({build.get('name')}) {testray_build_url(build['id'], routine['id'])}")
-    print(f"SHA {(build.get('gitHash') or '')[:12]}")
+        return data
+    data["build"] = build
     health = assess_build(routine["id"], build["id"])
-    if health:
-        print(f"Health: {format_health(health)}")
-        if health["out_of_scale"]:
-            # 2026-11-19: 714 not passed in a build the CI broke; a list of
-            # 700 tests and ranges says nothing about our tickets.
-            print("Out of scale: the build looks broken, tests not listed.")
-            return
+    data["health"] = health
+    # 2026-11-19: 714 not passed in a build the CI broke; a list of 700
+    # tests and ranges says nothing about our tickets.
+    if health and health["out_of_scale"]:
+        return data
 
-    ci, product = [], []
     for result in get_all_build_case_results(build["id"], include_case=True):
         status = (result.get("dueStatus") or {}).get("key") or "UNTESTED"
         if status == "PASSED":
@@ -745,54 +749,97 @@ def triage_routine_report(key, build_id=None):
             or name == "Top Level Build"
             or any(p.lower() in error.lower() for p in _CI_ERROR_PATTERNS)
         ):
-            ci.append((name, status, error))
+            data["ci"].append((name, status, error))
         else:
-            product.append((name, status, error, result.get("r_caseToCaseResult_c_caseId")))
-    print(f"Not passed: {len(ci) + len(product)}; CI/harness or not run: {len(ci)}")
+            data["product"].append({"name": name, "status": status,
+                                    "error": error,
+                                    "case_id": result.get("r_caseToCaseResult_c_caseId")})
+    data["more"] = max(0, len(data["product"]) - TRIAGE_ROUTINE_MAX_TESTS)
+    data["product"] = data["product"][:TRIAGE_ROUTINE_MAX_TESTS]
+
+    ranges = {}
+    for test in data["product"]:
+        line, green, red, red_date = _red_range(test["case_id"], routine["id"], build["id"])
+        test.update(history=line, red_date=red_date, range=None)
+        if not green or not red:
+            continue
+        rng = ranges.setdefault((green, red), {"green": green, "red": red,
+                                               "names": [], "ours": None,
+                                               "error": None})
+        rng["names"].append(test["name"])
+        test["range"] = list(ranges).index((green, red)) + 1
+    data["ranges"] = list(ranges.values())
+
+    watch = routine["watch_words"]
+    for rng in data["ranges"]:
+        try:
+            ours = _our_tickets_in_range(rng["green"], rng["red"],
+                                         routine["our_components"], routine["our_paths"])
+        except Exception as e:
+            rng["error"] = str(e)
+            continue
+        # Our tickets that touch folders of this routine's area (a CMS
+        # folder for the CMS) are the ones that can reach its tests: listed
+        # first with the folders; the others on one line.
+        rng["ours"] = []
+        for ticket, commits in ours.items():
+            files = [f for sha, _, _ in commits for f in get_commit_files("liferay", "liferay-portal", sha)]
+            outside = _outside_dirs(files)
+            touched = [(d, c) for d, c in outside.most_common() if any(w in d.lower() for w in watch)]
+            rng["ours"].append((ticket, commits, touched))
+    return data
+
+
+def triage_routine_report(key, build_id=None, data=None):
+    """Print triage_routine_data (gathered here unless `data` is given)."""
+    if data is None:
+        data = triage_routine_data(key, build_id)
+    routine, build, health = data["routine"], data["build"], data["health"]
+    if not build:
+        print(f"No DONE {routine['name']} build.")
+        return
+    print(f"=== {routine['name']} build {build['id']} ({build.get('name')}) {testray_build_url(build['id'], routine['id'])}")
+    print(f"SHA {(build.get('gitHash') or '')[:12]}")
+    if health:
+        print(f"Health: {format_health(health)}")
+        if health["out_of_scale"]:
+            print("Out of scale: the build looks broken, tests not listed.")
+            return
+
+    ci, product = data["ci"], data["product"]
+    print(f"Not passed: {len(ci) + len(product) + data['more']}; CI/harness or not run: {len(ci)}")
     for name, status, error in ci:
         print(f"  - {name[:110]} [{status}] {error[:90]}")
     if not product:
         print("No product failure: nothing of ours to look for.")
         return
 
-    print(f"Tests not passed with a product error ({len(product)}):")
-    ranges = defaultdict(list)
-    for name, status, error, case_id in product[:TRIAGE_ROUTINE_MAX_TESTS]:
-        line, green, red, red_date = _red_range(case_id, routine["id"], build["id"])
-        print(f"  - {name[:140]}\n      {status}; history {line}")
-        if error:
-            print(f"      error: {error[:200]}")
-        if not green or not red:
+    print(f"Tests not passed with a product error ({len(product) + data['more']}):")
+    for test in product:
+        print(f"  - {test['name'][:140]}\n      {test['status']}; history {test['history']}")
+        if test["error"]:
+            print(f"      error: {test['error'][:200]}")
+        if not test["range"]:
             print("      no pass in its history: no range to read")
             continue
-        ranges[(green, red)].append(name)
-        print(f"      red since {red_date}, range {list(ranges).index((green, red)) + 1}")
-    if len(product) > TRIAGE_ROUTINE_MAX_TESTS:
-        print(f"  ... {len(product) - TRIAGE_ROUTINE_MAX_TESTS} more not listed")
+        print(f"      red since {test['red_date']}, range {test['range']}")
+    if data["more"]:
+        print(f"  ... {data['more']} more not listed")
 
     watch = routine["watch_words"]
-    for n, ((green, red), names) in enumerate(ranges.items(), 1):
-        print(f"\nRange {n}: https://github.com/liferay/liferay-portal/compare/{green}...{red}")
-        short = (t.split(" > ", 1)[1] if " > " in t else t.rsplit(".", 1)[-1] for t in names)
+    for n, rng in enumerate(data["ranges"], 1):
+        print(f"\nRange {n}: https://github.com/liferay/liferay-portal/compare/{rng['green']}...{rng['red']}")
+        short = (t.split(" > ", 1)[1] if " > " in t else t.rsplit(".", 1)[-1] for t in rng["names"])
         print(f"  tests: {'; '.join(t[:70] for t in short)}")
-        try:
-            ours = _our_tickets_in_range(green, red, routine["our_components"], routine["our_paths"])
-        except Exception as e:
-            print(f"  (range not read: {e})")
+        if rng["error"]:
+            print(f"  (range not read: {rng['error']})")
             continue
-        if not ours:
+        if not rng["ours"]:
             print("  none of our tickets merged in its time window")
             continue
-        # Our tickets that touch folders of this routine's area (a CMS
-        # folder for the CMS) are the ones that can reach its tests: listed
-        # first with the folders; the others on one line.
-        near, far = [], []
-        for ticket, commits in ours.items():
-            files = [f for sha, _, _ in commits for f in get_commit_files("liferay", "liferay-portal", sha)]
-            outside = _outside_dirs(files)
-            touched = [(d, c) for d, c in outside.most_common() if any(w in d.lower() for w in watch)]
-            (near if touched else far).append((ticket, commits, touched))
-        print(f"  our tickets merged in its time window: {len(ours)}, {len(near)} touching {'/'.join(watch)} folders")
+        near = [o for o in rng["ours"] if o[2]]
+        far = [o for o in rng["ours"] if not o[2]]
+        print(f"  our tickets merged in its time window: {len(rng['ours'])}, {len(near)} touching {'/'.join(watch)} folders")
         for ticket, commits, touched in near:
             # Search lists newest first: the oldest commit names the change,
             # the newest is often an SF or "Inline" by the reviewer.
@@ -801,6 +848,75 @@ def triage_routine_report(key, build_id=None):
             print(f"      {', '.join(f'{d} ({c} files)' for d, c in touched[:4])}")
         if far:
             print(f"    not touching them: {', '.join(t for t, _, _ in far)}")
+
+
+def format_triage_routine_recap_lines(data):
+    """The routine of another team in the Slack recap, from
+    triage_routine_data: a few lines for the team, not the triage.
+
+    Added 2026-11-26: the CMS check was written by hand into the recap and
+    Andrea asked for it on every run. It gives the facts and names our
+    tickets merged in a red test's range touching the routine's folders as
+    suspects to read, never as the cause (see triage_routine_data): the
+    verdict stays with the triage, which reads their diff first. A test
+    with no pass in its history has no range, so it says so instead of
+    implying none of ours is involved."""
+    routine, build, health = data["routine"], data["build"], data["health"]
+    title = f"{routine['name']} check (did one of our changes break a {routine['name']} test?)"
+    if not build:
+        return [title, f"No DONE {routine['name']} build.", ""]
+    lines = [
+        title,
+        f"{build.get('name')} (SHA {(build.get('gitHash') or '')[:12]}): "
+        f"{testray_build_url(build['id'], routine['id'])}",
+    ]
+    if health and health["out_of_scale"]:
+        lines += [f"- Out of scale ({format_health(health)}): the build looks "
+                  "broken, tests not read against our tickets.", ""]
+        return lines
+    ci, product = data["ci"], data["product"]
+    total = len(ci) + len(product) + data["more"]
+    of_total = f" of {health['total']}" if health else ""
+    usual = f", usual {health['baseline_median']:g}" if health else ""
+    lines.append(f"- {total}{of_total} results not passed{usual}; {len(ci)} of them CI/harness or not run.")
+    if not product:
+        lines += ["Result: no product failure, nothing of ours to look for.", ""]
+        return lines
+
+    suspects, no_range = set(), 0
+    for test in product:
+        short = test["name"].split(" > ", 1)[1] if " > " in test["name"] else test["name"]
+        text = f"- {short[:120]}: {test['status']}"
+        if not test["range"]:
+            no_range += 1
+            text += ", no pass in its history (no range where it went red)"
+        else:
+            rng = data["ranges"][test["range"] - 1]
+            text += f", red since {test['red_date']}"
+            if rng["error"]:
+                text += "; range not read"
+            else:
+                near = [t for t, _, touched in rng["ours"] or [] if touched]
+                suspects.update(near)
+                text += (f"; ours in its range touching {'/'.join(routine['watch_words'])}"
+                         f" folders: {', '.join(near)}" if near
+                         else "; none of our tickets in its range touches its folders")
+        if test["error"]:
+            text += f'. Error: "{test["error"][:150]}"'
+        lines.append(text)
+    if data["more"]:
+        lines.append(f"- ... {data['more']} more not listed")
+    if suspects:
+        result = f"suspects to read, not causes yet: {', '.join(sorted(suspects))}"
+    else:
+        result = "none of our merged tickets is a suspect"
+    if no_range:
+        result += (f"; {no_range} test(s) red with no pass in history could "
+                   "not be read against our tickets")
+    lines.append(f"Result: {result}.")
+    lines.append("")
+    return lines
+
 
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "ticket":
