@@ -44,6 +44,12 @@ The routines run every other day, Acceptance every day on most of the same tests
 
 Write a "Routine triage" comment only where the evidence changed the verdict or its confidence (Step 7 rules). Never close or link on Acceptance alone: a test green in Acceptance can be red in the routine on the same SHA (LPD-114527). On a day with no new routine build this is the whole triage: then go to Step 9.
 
+### The CMS section of the log
+
+After the Acceptance section, every run prints "=== CMS tests against our tickets ===" (same output as `./run_local.sh --triage cms`; one section per routine in `TRIAGE_ROUTINES`). The CMS is another team's routine: the script opens no ticket on it. The section answers one question: did one of our PIM tickets break a CMS test? It lists the CMS tests not passed with a product error, their history and the range where each went red, and our tickets merged in that range, the ones touching CMS or object folders first.
+
+Report it in plain Italian, in one or two lines when nothing is ours ("CMS: nessun test rosso nuovo" or "rossi da prima dei nostri merge"). When one of our tickets touching CMS or object folders is in the range of a red test, read its diff against the failing step (Step 5, local clone first) before saying anything: a ticket in the range is a suspect, not a cause (2026-11-25: LPD-115762 touched `site-cms-site-initializer` in the range of the CMS Tasks table test, but the folder view, not the Tasks table). If the diff explains the failure, tell the user; the ticket to open goes to the CMS team or to the author of our ticket, and that is the user's choice, never the script's.
+
 ## Step 2 — Run
 
 ```bash

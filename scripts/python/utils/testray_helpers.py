@@ -107,6 +107,45 @@ ANALYZED_ROUTINES = (
 )
 
 
+# Routines of other teams whose tests our tickets can break. Never analyzed:
+# no task, no ticket, no closure on them. The triage reads them
+# (triage_context.triage_routine_report, `--triage <key>`, and at the end of
+# every run): the tests not passed in the latest DONE build, their history,
+# and our tickets among the commits of the range where each went red. Case
+# behind it: 2026-11-25, the PIM site initializer and the PIM pages are built
+# on the CMS (LPD-114567 also changed site-cms-site-initializer), and whether
+# a PIM merge had broken a CMS test was checked by hand on 8 builds.
+TRIAGE_ROUTINES = (
+    {
+        "id": 336020509,
+        "key": "cms",
+        "name": "CMS",
+        # A ticket in the range is ours when it has one of these Jira
+        # components. Not only the folders it touches: the PIM folders also
+        # get sweeps by other teams (REST Builder, Core Infrastructure,
+        # releases), and our PIM tickets also touch CMS folders.
+        "our_components": ("PIM Headless", "Product Information Management"),
+        # Where the triage looks for the keys of our tickets in a range (see
+        # triage_context._our_tickets_in_range); the components above then
+        # decide which are ours.
+        "our_paths": (
+            "modules/apps/headless/headless-pim",
+            "modules/apps/site-initializer/site-initializer-pim",
+            "modules/apps/site/site-pim-site-initializer",
+            "modules/apps/site/site-pim-site-initializer-api",
+            "modules/apps/site/site-pim-site-initializer-test",
+            "modules/apps/site/site-pim-site-initializer-test-util",
+        ),
+        # Our tickets touching folders whose path contains one of these come
+        # first in each range: through them a ticket of ours reaches a CMS
+        # test (LPD-114567 and LPD-115762 changed site-cms-site-initializer;
+        # the CMS keeps its content in object entries, and LPD-113061 changed
+        # object-service in the range of a CMS repeatable groups test).
+        "watch_words": ("cms", "object"),
+    },
+)
+
+
 # Subtask statuses that count as "nothing left to do here" when deciding
 # whether a task is fully analyzed: COMPLETE (analyzed/handled) and MERGED
 # (consolidated into another subtask — carries 0 results). See

@@ -73,3 +73,17 @@ if __name__ == "__main__":
         acceptance_report()
     except Exception as e:
         print(f"Acceptance check skipped: {e}")
+
+    # Routines of other teams our tickets can break (TRIAGE_ROUTINES, the
+    # CMS since 2026-11-25): their latest build against our tickets merged
+    # where each test went red. Read-only, after the Acceptance section and
+    # for the same reason: read on every run, not only when asked.
+    try:
+        from triage_context import triage_routine_report
+        from utils.testray_helpers import TRIAGE_ROUTINES
+
+        for routine in TRIAGE_ROUTINES:
+            print(f"\n=== {routine['name']} tests against our tickets ===\n")
+            triage_routine_report(routine["key"])
+    except Exception as e:
+        print(f"Triage routines check skipped: {e}")

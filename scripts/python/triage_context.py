@@ -6,6 +6,7 @@ routine-triage skill (.claude/skills/routine-triage/), and by hand.
     triage_context.py ticket LPD-X [LPD-Y ...]
     triage_context.py build <routine> [<build id>]
     triage_context.py acceptance [<build id>]
+    triage_context.py cms [<build id>]
 
 `ticket` prints, for each ticket: status, labels, the error and the tests it
 tracks, each test's status in the routine's latest build and its recent
@@ -22,6 +23,12 @@ errors point to a broken CI; many different errors point to regressions.
 `acceptance` prints, for every open routine ticket, the status of its tests
 in the latest DONE Acceptance build and their recent Acceptance history: the
 check to run when there is no new routine build (see acceptance_report).
+
+`cms` (any key of TRIAGE_ROUTINES) prints, for the latest DONE build of a
+routine of another team, each test not passed with a product error, the
+range where it went red and our tickets (by Jira component) merged in that
+range, with the folders they touch outside our modules
+(see triage_routine_report).
 
 Why a script and not ad-hoc API calls from the skill: the data is gathered
 the same way on every run, and the skill only judges it. Nothing here
@@ -47,6 +54,7 @@ from functools import lru_cache
 # analyzer.
 from utils.testray_helpers import (
     ANALYZED_ROUTINES,
+    TRIAGE_ROUTINES,
     _JIRA_CODE_BLOCK_RE,
     _get_latest_done_build,
     _normalize_error_keep_locator,
@@ -57,8 +65,10 @@ from github_api import (
     find_file_paths,
     get_commit_date,
     get_commits_for_path,
+    get_commit_files,
     get_compare_commits,
     is_ancestor,
+    search_commits,
     search_open_prs,
 )
 from jira_helpers import _jira, get_all_issues, get_issue_text, jira_issue_url
@@ -597,6 +607,201 @@ def acceptance_report(build_id=None):
         print()
 
 
+TRIAGE_ROUTINE_MAX_TESTS = 30
+_LPD_KEY_RE = re.compile(r"\bLPD-\d+\b")
+
+
+@lru_cache(maxsize=None)
+def _broken_build(routine_id, build_id):
+    """True for a build that was abandoned or is out of scale: its red
+    results say nothing about where a test broke. The CMS team does not
+    abandon its builds: the CMS build of 2026-11-19 (714 not passed against
+    ~13, same CI failure as the abandoned Commerce and UM builds) is only
+    out of scale."""
+    if build_id in get_abandoned_build_ids():
+        return True
+    health = assess_build(routine_id, build_id)
+    return bool(health and health["out_of_scale"])
+
+
+def _red_range(case_id, routine_id, build_id):
+    """(history letters, last green SHA, first red SHA, first red date) of a
+    test not passed in `build_id`. The red builds are the ones before the
+    first P going back from `build_id` (later builds ignored: they may be
+    green again), broken builds skipped (_broken_build); the SHAs are None
+    when the test has no pass in its history."""
+    history = sorted(
+        fetch_case_results(case_id, routine_id),
+        key=lambda h: h.get("executionDate") or "",
+        reverse=True,
+    )
+    while history and history[0].get("testrayBuildId") != build_id:
+        history.pop(0)
+    first_red = None
+    for h in history:
+        if h.get("status") == "PASSED":
+            return (
+                _history_line(case_id, routine_id),
+                h.get("gitHash"),
+                first_red and first_red.get("gitHash"),
+                first_red and (first_red.get("executionDate") or "")[:10],
+            )
+        if not _broken_build(routine_id, h.get("testrayBuildId")):
+            first_red = h
+    return _history_line(case_id, routine_id), None, None, None
+
+
+@lru_cache(maxsize=None)
+def _our_tickets_in_range(base, head, components, paths):
+    """{key: [(sha, author, subject)]} for our tickets merged in base...head,
+    by time window like the rest of this file (commit dates of base and
+    head; a commit merged later from an older branch can be missed).
+
+    The range is not listed: it can hold thousands of commits (6676 between
+    the CMS builds of 2026-11-17 and 2026-11-22, branch merges included).
+    The keys come from the commits on `paths` (our modules), are kept when
+    the Jira ticket has one of `components`, and each kept ticket's commits
+    in the window come from GitHub search, so the commits it made outside
+    our modules (a CMS folder) are there too. A ticket of ours that never
+    touches `paths` is missed."""
+    since = get_commit_date("liferay", "liferay-portal", base)
+    until = get_commit_date("liferay", "liferay-portal", head)
+    keys = set()
+    for path in paths:
+        for c in get_commits_for_path("liferay", "liferay-portal", path, head, since, until):
+            keys.update(_LPD_KEY_RE.findall(c["message"] or ""))
+    names = ", ".join(f'"{c}"' for c in components)
+    result = {}
+    for key in sorted(keys):
+        # One by one: a key that does not exist (a typo in a commit) makes a
+        # "key in (...)" JQL fail as a whole.
+        try:
+            if not get_all_issues(f"key = {key} AND component in ({names})", fields=["key"]):
+                continue
+        except Exception:
+            continue
+        commits = search_commits("liferay", "liferay-portal", key, since[:10], until[:10])
+        result[key] = [(c["sha"], c["author"], c["message"]) for c in commits]
+    return result
+
+
+def _outside_dirs(files, our_words=("pim",)):
+    """Folders (modules/apps/<group>/<module>, or the first three levels) a
+    list of files touches outside our own modules: what in a PIM ticket can
+    reach a CMS test."""
+    dirs = Counter()
+    for f in files:
+        if any(w in f.lower() for w in our_words):
+            continue
+        parts = f.split("/")
+        depth = 4 if parts[:2] == ["modules", "apps"] else 3
+        dirs["/".join(parts[:depth])] += 1
+    return dirs
+
+
+def triage_routine_report(key, build_id=None):
+    """A routine of another team (TRIAGE_ROUTINES) read against our tickets.
+
+    For each test not passed in its latest DONE build (CI/harness rows only
+    counted): the history, the range where it went red, and the tickets of
+    ours (by Jira component) merged in that range, with the folders they
+    touch outside our modules. Read only, and no verdict: a PIM ticket in
+    the range is a suspect to read, not a cause (2026-11-25: the CMS
+    TasksSection FDS test, red on 11-19 and 11-22, had PIM merges in its
+    range next to Frontend Data Set commits of other teams, LPD-117521 and
+    LPD-116535). The folders a ticket touches outside our modules are what
+    to read first: a CMS test is reached through CMS code."""
+    routine = next(r for r in TRIAGE_ROUTINES if r["key"] == key)
+    builds = get_routine_to_builds(routine["id"])
+    if build_id is None:
+        build = _get_latest_done_build(builds, quiet=True)
+    else:
+        build = next(b for b in builds if b["id"] == build_id)
+    if not build:
+        print(f"No DONE {routine['name']} build.")
+        return
+    print(f"=== {routine['name']} build {build['id']} ({build.get('name')}) {testray_build_url(build['id'], routine['id'])}")
+    print(f"SHA {(build.get('gitHash') or '')[:12]}")
+    health = assess_build(routine["id"], build["id"])
+    if health:
+        print(f"Health: {format_health(health)}")
+        if health["out_of_scale"]:
+            # 2026-11-19: 714 not passed in a build the CI broke; a list of
+            # 700 tests and ranges says nothing about our tickets.
+            print("Out of scale: the build looks broken, tests not listed.")
+            return
+
+    ci, product = [], []
+    for result in get_all_build_case_results(build["id"], include_case=True):
+        status = (result.get("dueStatus") or {}).get("key") or "UNTESTED"
+        if status == "PASSED":
+            continue
+        name = (result.get("r_caseToCaseResult_c_case") or {}).get("name") or "?"
+        error = " ".join((result.get("errors") or "").split())
+        # UNTESTED is not red (LPD-99531, see acceptance_report); the "Top
+        # Level Build" row is the CI job itself.
+        if (
+            status == "UNTESTED"
+            or name == "Top Level Build"
+            or any(p.lower() in error.lower() for p in _CI_ERROR_PATTERNS)
+        ):
+            ci.append((name, status, error))
+        else:
+            product.append((name, status, error, result.get("r_caseToCaseResult_c_caseId")))
+    print(f"Not passed: {len(ci) + len(product)}; CI/harness or not run: {len(ci)}")
+    for name, status, error in ci:
+        print(f"  - {name[:110]} [{status}] {error[:90]}")
+    if not product:
+        print("No product failure: nothing of ours to look for.")
+        return
+
+    print(f"Tests not passed with a product error ({len(product)}):")
+    ranges = defaultdict(list)
+    for name, status, error, case_id in product[:TRIAGE_ROUTINE_MAX_TESTS]:
+        line, green, red, red_date = _red_range(case_id, routine["id"], build["id"])
+        print(f"  - {name[:140]}\n      {status}; history {line}")
+        if error:
+            print(f"      error: {error[:200]}")
+        if not green or not red:
+            print("      no pass in its history: no range to read")
+            continue
+        ranges[(green, red)].append(name)
+        print(f"      red since {red_date}, range {list(ranges).index((green, red)) + 1}")
+    if len(product) > TRIAGE_ROUTINE_MAX_TESTS:
+        print(f"  ... {len(product) - TRIAGE_ROUTINE_MAX_TESTS} more not listed")
+
+    watch = routine["watch_words"]
+    for n, ((green, red), names) in enumerate(ranges.items(), 1):
+        print(f"\nRange {n}: https://github.com/liferay/liferay-portal/compare/{green}...{red}")
+        short = (t.split(" > ", 1)[1] if " > " in t else t.rsplit(".", 1)[-1] for t in names)
+        print(f"  tests: {'; '.join(t[:70] for t in short)}")
+        try:
+            ours = _our_tickets_in_range(green, red, routine["our_components"], routine["our_paths"])
+        except Exception as e:
+            print(f"  (range not read: {e})")
+            continue
+        if not ours:
+            print("  none of our tickets merged in its time window")
+            continue
+        # Our tickets that touch folders of this routine's area (a CMS
+        # folder for the CMS) are the ones that can reach its tests: listed
+        # first with the folders; the others on one line.
+        near, far = [], []
+        for ticket, commits in ours.items():
+            files = [f for sha, _, _ in commits for f in get_commit_files("liferay", "liferay-portal", sha)]
+            outside = _outside_dirs(files)
+            touched = [(d, c) for d, c in outside.most_common() if any(w in d.lower() for w in watch)]
+            (near if touched else far).append((ticket, commits, touched))
+        print(f"  our tickets merged in its time window: {len(ours)}, {len(near)} touching {'/'.join(watch)} folders")
+        for ticket, commits, touched in near:
+            # Search lists newest first: the oldest commit names the change,
+            # the newest is often an SF or "Inline" by the reviewer.
+            author = Counter(a for _, a, _ in commits).most_common(1)[0][0]
+            print(f"    {ticket} ({author}, {len(commits)} commits) {commits[-1][2][:80]}")
+            print(f"      {', '.join(f'{d} ({c} files)' for d, c in touched[:4])}")
+        if far:
+            print(f"    not touching them: {', '.join(t for t, _, _ in far)}")
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "ticket":
         for k in sys.argv[2:]:
@@ -605,5 +810,7 @@ if __name__ == "__main__":
         build_report(sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else None)
     elif len(sys.argv) >= 2 and sys.argv[1] == "acceptance":
         acceptance_report(int(sys.argv[2]) if len(sys.argv) > 2 else None)
+    elif len(sys.argv) >= 2 and sys.argv[1] in {r["key"] for r in TRIAGE_ROUTINES}:
+        triage_routine_report(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else None)
     else:
         sys.exit(__doc__)

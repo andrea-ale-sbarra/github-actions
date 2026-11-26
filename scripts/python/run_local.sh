@@ -57,7 +57,7 @@ while (( $# > 0 )); do
         --build=*) SUBCOMMAND="--build"; BUILD_IDS+=("${1#--build=}") ;;
         *)
             echo "❌ Argomento non riconosciuto: $1"
-            echo "   Usa: --live | --force | --abandon | --resume | --routine <name|id> | --priorities | --summary | --inspect | --diagnose | --check-pr-failures | --poshi-burndown | --build <id> | --triage ticket <LPD-X...> | --triage build <routine> [<id>] | --triage acceptance [<id>]"
+            echo "   Usa: --live | --force | --abandon | --resume | --routine <name|id> | --priorities | --summary | --inspect | --diagnose | --check-pr-failures | --poshi-burndown | --build <id> | --triage ticket <LPD-X...> | --triage build <routine> [<id>] | --triage acceptance [<id>] | --triage cms [<id>]"
             exit 1
             ;;
     esac

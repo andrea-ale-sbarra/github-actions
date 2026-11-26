@@ -198,6 +198,36 @@ def get_compare_commits(owner, repo, base, head):
     }
 
 
+@lru_cache(maxsize=None)
+def search_commits(owner, repo, term, since_date, until_date):
+    """Commits whose message contains `term` (an LPD key), committed between
+    two dates (YYYY-MM-DD, inclusive), as {sha, message, author}, newest
+    first; first 100.
+    Used to find every commit of one ticket in a range without listing the
+    range: a range of five days held 6676 commits on 2026-11-22 (branch
+    merges included), 67 compare pages per range."""
+    payload = _get_json(
+        f"{GITHUB_API}/search/commits?q=repo:{owner}/{repo}+{term}"
+        f"+committer-date:{since_date}..{until_date}"
+        f"&sort=committer-date&order=desc&per_page=100"
+    ) or {}
+    return [
+        {
+            "sha": c.get("sha"),
+            "message": ((c.get("commit") or {}).get("message") or "").split("\n")[0],
+            "author": ((c.get("commit") or {}).get("author") or {}).get("name"),
+        }
+        for c in payload.get("items") or []
+    ]
+
+
+@lru_cache(maxsize=None)
+def get_commit_files(owner, repo, sha):
+    """Paths a commit touches (first 300, GitHub's page)."""
+    payload = _get_json(f"{GITHUB_API}/repos/{owner}/{repo}/commits/{sha}") or {}
+    return tuple(f.get("filename") for f in payload.get("files") or [])
+
+
 def get_commit_date(owner, repo, sha):
     """Committer date (ISO 8601) of `sha`, or None."""
     return _get_commit_committer_date(owner, repo, sha)
