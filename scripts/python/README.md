@@ -30,7 +30,7 @@ With no flags, `./run_local.sh` runs the main analyzer (`analyze_testray_results
 | `--resume` | Resumes the most recent analysis task instead of starting from the newest build |
 | `--routine <name\|id>` | Restricts the analysis to a single routine (e.g. `--routine user_management`). If omitted, it runs on all of them |
 | `--force` | Analyzes a build even when the build check finds it out of scale (see below). Use it with `--routine` |
-| `--abandon` | Discards the latest build instead of analyzing it: task marked ABANDONED, no ticket opened, open tickets closed only when every test they list PASSED in that build, PR check still run, Slack message says the build was discarded. Use it with `--routine` |
+| `--abandon` | Discards the latest build instead of analyzing it: task marked ABANDONED, no ticket opened, open tickets closed only when every test they list PASSED in that build, PR check still run, Slack message says the build was discarded. Use it with `--routine`. Later runs skip the red results of an abandoned build: the "GitHub Compare" link of a new ticket starts at the first red build that was not abandoned, and the `--triage` history shows it as `X`, out of the red count and of the flips |
 
 ### Build check
 

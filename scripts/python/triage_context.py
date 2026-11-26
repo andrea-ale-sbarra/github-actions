@@ -65,6 +65,7 @@ from jira_helpers import _jira, get_all_issues, get_issue_text, jira_issue_url
 from testray_api import (
     ACCEPTANCE_ROUTINE_ID,
     fetch_case_results,
+    get_abandoned_build_ids,
     get_all_build_case_results,
     get_routine_to_builds,
     testray_build_url,
@@ -126,19 +127,36 @@ def _latest_build_index(routine_id):
 
 def _history_line(case_id, routine_id):
     """Newest first, one letter per build: P passed, F failed, B blocked,
-    U untested, T test fix; plus how many builds it has been red."""
+    U untested, T test fix, X not passed in a build that was ABANDONED (the
+    CI broke it); plus how many builds it has been red.
+
+    X is left out of the red count and of the flips: one broken build turns
+    a stable "PPPP" into "PFPP", two flips for a test that never broke (the
+    Commerce and UM builds of 2026-11-19, abandoned, red on most tests). A
+    pass in an abandoned build stays a P: the test did run.
+    """
     history = sorted(
         fetch_case_results(case_id, routine_id),
         key=lambda h: h.get("executionDate") or "",
         reverse=True,
     )[:HISTORY_LENGTH]
-    letters = "".join((h.get("status") or "?")[0] for h in history)
+    abandoned = get_abandoned_build_ids()
+
+    def letter(h):
+        status = h.get("status") or "?"
+        if status != "PASSED" and h.get("testrayBuildId") in abandoned:
+            return "X"
+        return status[0]
+
+    letters = "".join(letter(h) for h in history)
     red = 0
-    for h in history:
-        if h.get("status") == "PASSED":
+    for c in letters:
+        if c == "P":
             break
-        red += 1
-    flips = sum(1 for a, b in zip(letters, letters[1:]) if (a == "P") != (b == "P"))
+        if c != "X":
+            red += 1
+    counted = letters.replace("X", "")
+    flips = sum(1 for a, b in zip(counted, counted[1:]) if (a == "P") != (b == "P"))
     return f"{letters}  (newest first; red for the last {red}, {flips} pass/fail flips)"
 
 

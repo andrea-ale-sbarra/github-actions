@@ -146,7 +146,7 @@ One of:
 
 - **CI / infrastructure → chiudibile**: CI/harness error (see patterns in `triage_context.py`), network errors against the CI host (`net::ERR_…` on `http://i-…:8080`), or the test already PASSED in the latest build with no product change in between.
   NOT CI: `TEST_SETUP_ERROR: Unable to delete the portal instances …`. An instance that survives deletion was left dirty by another test (or deletion itself is broken): a signal that something is wrong, to investigate, never to close as noise (Andrea, 2026-11-06; LPD-109582, 109861, 110849, 111086). Look at which test ran before it in the same batch.
-- **Test fragile**: history alternates (≥2 pass/fail flips in 12), no commit on the test file or app explains it, often reopened tickets.
+- **Test fragile**: history alternates (≥2 pass/fail flips in 12), no commit on the test file or app explains it, often reopened tickets. An `X` in the history is a build that was abandoned (the CI broke it): it is not a flip and not a red build.
 - **Doppione di LPD-Y**: same test, or same error family (same locator up to a small variation, same exception) as another ticket, or same error cluster in `--triage build`; name the ticket to keep (the oldest still open, or the one someone is working on).
 - **Test da sistemare**: a commit in the range changed the UI/API the test relies on on purpose (renamed label, moved element, removed command); cite the commit.
 - **Bug probabile**: the test checks behavior and a commit in the app changed that behavior without changing the test; cite the commit and what it touches.

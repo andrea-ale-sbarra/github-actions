@@ -132,6 +132,36 @@ def complete_task(task_id):
     return response.json()
 
 
+@lru_cache(maxsize=None)
+def get_abandoned_build_ids():
+    """Ids of every build whose task is ABANDONED, across all routines
+    (about 1000 tasks in 2026-11, three pages): one query per run instead of
+    one per build. A discarded build is one the CI broke (see abandon_task):
+    its red results say nothing about the product, so the first-red SHA of
+    the GitHub Compare link and the triage history skip them.
+    """
+    from urllib.parse import quote
+
+    flt = quote("dueStatus eq 'ABANDONED'", safe="")
+    ids = set()
+    page = 1
+    while True:
+        url = (
+            f"{BASE_URL}/tasks?filter={flt}&fields=id,r_buildToTasks_c_buildId"
+            f"&pageSize=500&page={page}"
+        )
+        items = _get_json(url).get("items", [])
+        ids.update(
+            i["r_buildToTasks_c_buildId"]
+            for i in items
+            if i.get("r_buildToTasks_c_buildId")
+        )
+        if len(items) < 500:
+            break
+        page += 1
+    return frozenset(ids)
+
+
 def abandon_task(task_id):
     """Mark a task ABANDONED: the build was discarded (CI broken), not analyzed.
 

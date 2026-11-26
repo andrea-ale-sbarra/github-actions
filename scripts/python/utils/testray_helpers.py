@@ -58,6 +58,7 @@ from testray_api import (
     get_case_type_name,
     get_routine_to_builds,
     abandon_task,
+    get_abandoned_build_ids,
 )
 from build_health import assess_build, format_health
 
@@ -2136,6 +2137,15 @@ def _get_last_passing_git_hash(case_id, build_id, history_cache):
 def _get_first_failing_git_hash(case_id, build_id, history_cache):
     """
     Find the first failing git hash after the last passing run for this case.
+
+    Red results of an ABANDONED build are skipped: the CI broke that build,
+    so it is not where the test broke. On 2026-11-23 the PIM site initializer
+    tests (LPD-116994, 116997, 117000..117002) got the compare link
+    2bcc622...21f415d, 21f415d being the Commerce build of 2026-11-19 the
+    portal could not start in and that was abandoned; the first real red was
+    the next build, 5e1e906, and LPD-116996, red only from 5e1e906, looked
+    like a different break. A pass in an abandoned build still counts as a
+    pass (_get_last_passing_result): a test that passed did run.
     """
     entire_history = history_cache.get(case_id)
     if entire_history is None:
@@ -2157,10 +2167,13 @@ def _get_first_failing_git_hash(case_id, build_id, history_cache):
     if not last_passing:
         return result_history_for_build[0].get("gitHash")
 
+    abandoned = get_abandoned_build_ids()
     last_pass_date = _parse_execution_date(last_passing["executionDate"])
     for item in reversed(entire_history):
         exec_date = _parse_execution_date(item.get("executionDate"))
         if not exec_date:
+            continue
+        if item.get("testrayBuildId") in abandoned:
             continue
         if (
             exec_date > last_pass_date
