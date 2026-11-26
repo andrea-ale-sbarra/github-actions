@@ -36,6 +36,8 @@ With no flags, `./run_local.sh` runs the main analyzer (`analyze_testray_results
 
 Before creating the task of a new build, the analyzer compares the results not passed with the median of the previous 10 builds of the routine (`utils/build_health.py`). At 5x the median and at least 50 more (2.5x for Acceptance, used only by the PR check), the build is out of scale: the routine is not analyzed, in dry run too, and the run prints the numbers and the two ways on: `--routine <r> --abandon` or `--routine <r> --force`. Case behind it: run 9957 of 2026-11-03, broken by the CI (Commerce 481 not passed against ~45). Look at how the build fails before choosing: a real regression can also be out of scale (UM 2026-10-07/08). The PR check prints a warning under a ticket whose build is out of scale.
 
+Before opening a ticket, the analyzer looks for an open routine ticket of the same failure and adds the tests to it (`_find_existing_open_ticket_for_error`): one that lists one of the tests, or has the same error in a `{code}` block (locator kept, digit runs and the CI host masked, the `testMethod: ` an integration test puts before the exception stripped). When none matches, an integration test class failing without a message ("4 Failed tests testA testB …") joins a ticket that lists a test class of the same module (the package before `.internal.`) with the same first red SHA in its GitHub Compare link. Case behind it: 2026-11-23, the PIM site initializer tables left behind opened eight tickets, one per test class; with this rule they would have been two (the two classes with no pass in their history cannot be placed by first red build).
+
 ### Diagnostic sub-commands
 
 These replace the main analyzer, they don't run alongside it.

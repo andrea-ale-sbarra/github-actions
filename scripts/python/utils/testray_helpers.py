@@ -1206,6 +1206,27 @@ def _testing_epic_jql():
     return f"issue = {epic_key}"
 
 
+# "testGetCreationMenu: com.liferay.site.exception.InitializationException: …":
+# an integration test result puts the name of the failing method in front of
+# the exception. Two test classes broken by the same cause then carry
+# different texts and never match: on 2026-11-23 LPD-116998, 116999, 117000,
+# 117001 and 117002 had the same PSQLException (PIM site initializer, tables
+# left behind) behind "testGetCreationMenu:", "testPortalInstanceRegistered:",
+# "testAddDepotEntry:", "test:" and "testFilter:", and became five tickets.
+# Only a single word followed by a dotted exception class is stripped, so
+# Playwright's "Error: Timeout…" and a bare "java.lang.AssertionError: …"
+# stay as they are. Limit: two test classes failing with the same bare text
+# ("testA: java.lang.NullPointerException", "testB: java.lang.Null…") now
+# match too, as two bare NPEs without the prefix always did.
+_TEST_METHOD_PREFIX_RE = re.compile(
+    r"^\w+: (?=[a-z]\w*(?:\.[\w$]+)+(?:Exception|Error)\b)"
+)
+
+
+def _strip_test_method_prefix(error):
+    return _TEST_METHOD_PREFIX_RE.sub("", error)
+
+
 def _normalize_error(error):
     """Normalize and clean error messages for comparison and pattern matching."""
     if not error:
@@ -1213,6 +1234,7 @@ def _normalize_error(error):
 
     # Collapse whitespace
     error = " ".join(error.strip().split())
+    error = _strip_test_method_prefix(error)
 
     error = _mask_ci_host(error)
 
@@ -1236,6 +1258,7 @@ def _normalize_error_keep_locator(error):
         return ""
 
     error = " ".join(error.strip().split())
+    error = _strip_test_method_prefix(error)
     error = _strip_playwright_error_noise(error)
     error = _mask_ci_host(error)
     error = re.sub(r"\d{4}-\d{2}-\d{2}[\sT]\d{2}:\d{2}:\d{2}", "", error)
@@ -2335,8 +2358,63 @@ def _find_similar_open_issues(case_id, result_error, *, return_list=False):
 
 _JIRA_CODE_BLOCK_RE = re.compile(r"\{code\}(.*?)\{code\}", re.DOTALL)
 
+# An integration test class whose methods failed without a message: Testray
+# stores only "4 Failed tests testOnBeforeCreate testOnAfterRemove …", the
+# exception is in the log on GCS. No text to compare, so these rows never
+# matched a ticket and every test class got its own (2026-11-23: LPD-116994
+# and LPD-116997 next to LPD-116998..117002, all the PIM site initializer
+# tables left behind).
+_TEXTLESS_ERROR_RE = re.compile(r"^\d+ (?:Failed|Skipped) tests?\b")
+_JAVA_TEST_CLASS_RE = re.compile(r"^[a-z]\w*(?:\.\w+)+\.[A-Z]\w*$")
+_COMPARE_HEAD_RE = re.compile(
+    r"github\.com/liferay/liferay-portal/compare/[0-9a-f]+\.\.\.([0-9a-f]+)"
+)
 
-def _find_existing_open_ticket_for_error(epic, case_names, errors):
+
+def _is_textless_error(error):
+    return bool(_TEXTLESS_ERROR_RE.match(" ".join((error or "").split())))
+
+
+def _java_test_module(case_name):
+    """
+    The module an integration test class belongs to, from its name: the
+    package before ".internal." ("com.liferay.site.pim.site.initializer"
+    for "com.liferay.site.pim.site.initializer.internal.engine.test.
+    PIMLinkEngineTest"), else the whole package, which is narrower than the
+    module and so never joins too much. None for anything that is not a
+    Java class name (Playwright specs, Poshi test names).
+    """
+    if not case_name or not _JAVA_TEST_CLASS_RE.match(case_name):
+        return None
+    if ".internal." in case_name:
+        return case_name.split(".internal.", 1)[0]
+    return case_name.rsplit(".", 1)[0]
+
+
+def _first_red_by_module(failures, build_id, history_cache):
+    """
+    {(module, first red SHA)} for the integration test classes in
+    `failures`, the SHA being the head of the "GitHub Compare" link the
+    ticket will carry. Only tests that passed before count: for a test that
+    never passed _get_first_failing_git_hash returns the current build, not
+    the build where it broke.
+    """
+    pairs = set()
+    for f in failures:
+        module = _java_test_module(get_case_info(f["case_id"]).get("name"))
+        if not module:
+            continue
+        if not _get_last_passing_git_hash(f["case_id"], build_id, history_cache):
+            continue
+        head = _get_first_failing_git_hash(f["case_id"], build_id, history_cache)
+        if head:
+            pairs.add((module, head))
+    return pairs
+
+
+def _find_existing_open_ticket_for_error(
+    epic, case_names, errors, first_red_by_module=None
+):
     """
     Pre-creation dedup: search Jira for an already-open routine task that
     covers one of the failing tests, or the same error. Catches the case
@@ -2347,6 +2425,10 @@ def _find_existing_open_ticket_for_error(epic, case_names, errors):
     carries one of `errors` in a {code} block, locator included. The summary
     is not used: Jira cuts it before the locator, so every open Poshi
     "Element is not present" ticket would look like the same error.
+    With `first_red_by_module` (see _first_red_by_module), a ticket also
+    matches when one side has only textless errors ("N Failed tests …") and
+    the ticket lists a test class of the same module whose GitHub Compare
+    head is the same first red SHA: same module, broken by the same build.
     Returns the existing issue key, or None.
     """
     # Oldest first: when two open tickets match (a duplicate opened before
@@ -2355,6 +2437,7 @@ def _find_existing_open_ticket_for_error(epic, case_names, errors):
     return _find_matching_routine_ticket(
         epic, case_names, errors, "statusCategory != Done",
         order_by="created ASC",
+        first_red_by_module=first_red_by_module,
     )
 
 
@@ -2380,12 +2463,15 @@ def _find_recently_discarded_ticket_for_error(
 
 
 def _find_matching_routine_ticket(
-    epic, case_names, errors, status_clause, order_by=None
+    epic, case_names, errors, status_clause, order_by=None,
+    first_red_by_module=None,
 ):
     """
     Return the first routine ticket matching `status_clause` whose
     description lists one of `case_names`, or carries one of `errors` in a
-    {code} block, locator included. None if nothing matches.
+    {code} block, locator included. If none does and `first_red_by_module`
+    is given, the first one that matches on module and first red SHA (see
+    _find_existing_open_ticket_for_error). None if nothing matches.
     """
     case_names = [name for name in case_names if name and name != "N/A"]
     new_errors = {_normalize_error_keep_locator(e) for e in errors if e}
@@ -2426,6 +2512,30 @@ def _find_matching_routine_ticket(
         }
         if new_errors & candidate_errors:
             return c.key
+
+    # Second pass, only after no ticket matched on test or text: a weaker
+    # guess must not take the tests away from a ticket that names them.
+    if not first_red_by_module:
+        return None
+    ours_textless = any(_is_textless_error(e) for e in errors)
+    for c in candidates:
+        description = getattr(c.fields, "description", None) or ""
+        if not ours_textless and not any(
+            _is_textless_error(block)
+            for block in _JIRA_CODE_BLOCK_RE.findall(description)
+        ):
+            continue
+        heads = set(_COMPARE_HEAD_RE.findall(description))
+        modules = {
+            _java_test_module(name) for name in _tests_listed_in_ticket(description)
+        }
+        for module, head in first_red_by_module:
+            if module in modules and head in heads:
+                print(
+                    f"  [dedup] {c.key}: same module {module}, first red at "
+                    f"{head[:12]}, one side without error text"
+                )
+                return c.key
 
     return None
 
@@ -3069,6 +3179,9 @@ def _create_investigation_task_for_subtask(
         epic,
         case_names,
         [f["error"] for f in subtask_unique_failures],
+        first_red_by_module=_first_red_by_module(
+            subtask_unique_failures, latest_build_id, case_history_cache
+        ),
     )
     if existing_key:
         print(
