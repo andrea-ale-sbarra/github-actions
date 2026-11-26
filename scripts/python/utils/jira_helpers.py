@@ -268,6 +268,48 @@ def reopen_issue(issue_key, comment, due_date=None, label=None):
         return False
 
 
+def _add_labels_and_verify(issue_key, wanted_labels):
+    """Add `wanted_labels` to a just-created ticket in one update, then read
+    them back and add the missing ones once more.
+
+    Labels cannot be set in the create call: on LPD the field is not on the
+    create screen. They used to be added with two updates in a row (routine
+    label + unplanned_work, then acceptance_failure). On LPD-116998
+    (2026-11-23) the second "add" was applied to a stale copy of the
+    ticket, one second after Jira Automation set its Team field: the
+    changelog shows our own update turning "commerce_routine_tasks
+    unplanned_work" into "acceptance_failure". Without the routine label the
+    analyzer never finds the ticket again, so it is never closed. It
+    happened once in 100 acceptance_failure tickets of the last 60 days.
+
+    One update removes the window between two label writes; the read-back
+    covers any other race (e.g. an automation rewriting the labels). It
+    retries once and logs: a ticket still missing a label after that is
+    printed, not raised, because the ticket itself was created.
+    """
+    _jira().issue(issue_key).update(
+        update={"labels": [{"add": name} for name in wanted_labels]}
+    )
+    present = set(_jira().issue(issue_key, fields="labels").fields.labels or [])
+    missing = [name for name in wanted_labels if name not in present]
+    if not missing:
+        return
+    print(
+        f"⚠ Labels {missing} missing on {issue_key} right after creation "
+        f"(found {sorted(present)}): adding them again."
+    )
+    _jira().issue(issue_key).update(
+        update={"labels": [{"add": name} for name in missing]}
+    )
+    present = set(_jira().issue(issue_key, fields="labels").fields.labels or [])
+    still_missing = [name for name in wanted_labels if name not in present]
+    if still_missing:
+        print(
+            f"✘ Labels {still_missing} still missing on {issue_key}: add them "
+            "by hand, or the analyzer will not find this ticket again."
+        )
+
+
 def create_jira_task(epic, summary, description, component, label, due_date=None, priority=None, routine_label=None):
     """
     Creates a Jira investigation task for unique failures.
@@ -355,11 +397,8 @@ def create_jira_task(epic, summary, description, component, label, due_date=None
             raise
 
     label_to_apply = routine_label or os.getenv("ROUTINE_LABEL", "routine_tasks")
-    _jira().issue(new_issue.key).update(
-        update={"labels": [{"add": label_to_apply}, {"add": "unplanned_work"}]}
-    )
-    if label:
-        _jira().issue(new_issue.key).update(update={"labels": [{"add": label}]})
+    wanted_labels = [label_to_apply, "unplanned_work"] + ([label] if label else [])
+    _add_labels_and_verify(new_issue.key, wanted_labels)
     if priority:
         try:
             _jira().issue(new_issue.key).update(fields={"priority": {"name": priority}})
