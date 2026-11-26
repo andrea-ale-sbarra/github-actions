@@ -2548,10 +2548,18 @@ def _get_case_result_history_for_routine_not_passed(case_id):
     return _sort_by_execution_date_desc(items)
 
 
+# Days since the test last passed → Jira priority. Only names allowed on
+# LPD tasks: Critico, High, Medium, Low (./run_local.sh --priorities).
+# There was a (5, "Normal") step: "Normal" exists in the Jira instance but
+# not in LPD's priority scheme, so Jira rejected it ("La priorità
+# selezionata non è valida") and the ticket stayed at the default, Low:
+# 7 tickets on 2026-11-23 (LPD-116994..117002) and LinkResourceTest on
+# 2026-11-24 (LPD-117327, red for 6 days). A test red for 5-7 days is
+# now Medium, not Low, which is what the Normal step meant: more urgent
+# than a test red for 3 days.
 _PRIORITY_LADDER = [
     (13, "High"),
-    (8, "Medium"),
-    (5, "Normal"),
+    (5, "Medium"),
     (3, "Low"),
 ]
 
