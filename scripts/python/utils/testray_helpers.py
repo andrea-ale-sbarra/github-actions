@@ -205,7 +205,9 @@ def analyze_testflow(builds, routine_id):
     Returns (task_id, closure_summary, cleanup_summary) where:
       - task_id is None if no analysis happened, except when the latest
         build's task is already COMPLETE: then its id is returned with no
-        summaries, so the recap still lists the routine's open tickets
+        summaries, so the recap still lists the routine's open tickets.
+        When task_id is None, closure_summary carries "no_task" (the
+        sentence the recap prints for the routine) or "blocked"
       - closure_summary is None if no stale closure was attempted,
         otherwise a dict {build_id, build_hash, attempted, closed} from
         _close_stale_routine_tasks. The caller uses it to print the
@@ -220,7 +222,7 @@ def analyze_testflow(builds, routine_id):
     try:
         latest_build = _pick_build_to_analyze(builds)
         if not latest_build:
-            return None, None, None
+            return None, {"no_task": "No build to analyze."}, None
 
         gate = _check_build_before_analysis(latest_build)
         if gate == "blocked":
@@ -228,7 +230,34 @@ def analyze_testflow(builds, routine_id):
         if gate == "abandon":
             return _abandon_build(latest_build)
 
-        task_id, latest_build_id, complete_task_id = _prepare_task(latest_build)
+        task_id, latest_build_id, complete_task_id, abandoned_task_id = (
+            _prepare_task(latest_build)
+        )
+
+        # A discarded latest build and no new one: the routine still gets its
+        # section in the recap, with its open tickets and this sentence
+        # instead of the task link. Case: 2026-11-26, the UM build of 11-24 had been discarded
+        # with --abandon the day before, no new build came, and the recap
+        # had no User Management section at all: its open ticket (1) was
+        # missing from the counts handed to Slack.
+        #
+        # The discarded-build check comes before the dry-run fallback: that
+        # fallback previews an older build's open task (on 2026-11-26 a UM
+        # task of 2026-08-09), while --live, on a discarded latest build,
+        # analyzes nothing. The dry run must show what --live would do.
+        build_url = testray_build_url(latest_build_id, routine_id)
+        if not task_id and abandoned_task_id:
+            print(
+                f"ℹ No new build since build {latest_build_id} was discarded "
+                f"(task {abandoned_task_id} ABANDONED). Listing the open "
+                "tickets in the recap only."
+            )
+            return None, {
+                "no_task": (
+                    "No new build since the last one was discarded because "
+                    f"of CI issues: {build_url}"
+                ),
+            }, None
 
         if not task_id and os.getenv("DRY_RUN", "false").lower() == "true":
             task_id, latest_build_id = _find_analyzable_build_for_dry_run(builds)
@@ -240,9 +269,13 @@ def analyze_testflow(builds, routine_id):
             )
             return complete_task_id, None, None
 
+        # Same for any other routine with no task: its section in the recap
+        # says why, instead of the task link.
         if not task_id:
             print("✘ Could not find or create a valid task, exiting.")
-            return None, None, None
+            return None, {
+                "no_task": f"Not analyzed: no analysis task for {build_url}",
+            }, None
 
         sha = get_build_sha(latest_build_id)
         acceptance_build_id = get_acceptance_build_id_for_current_sha(sha)
@@ -295,7 +328,9 @@ def print_slack_summary(
     {build_id, build_hash, attempted, closed} from
     _close_stale_routine_tasks. cleanup_summary may be None or a dict
     from _cleanup_discarded_parents_subtasks. Routines whose task_id
-    is None (no DONE build, dry-run, etc.) are skipped.
+    is None (no DONE build, discarded build, build stopped by the build
+    check, dry-run) still get their section with the open tickets, and a
+    sentence on why nothing was analyzed instead of the task link.
 
     `pr_check_by_routine_id` (optional) maps routine id → list of PR
     check result dicts (see `utils.pr_check.check_pr_failures_for_routine`).
@@ -318,23 +353,44 @@ def print_slack_summary(
     # github_api's environment requirements.
     from pr_check import format_pr_check_block
 
-    active_runs = [entry for entry in routine_runs if entry[1]]
-    if not active_runs:
+    routine_runs = list(routine_runs)
+    if not routine_runs:
         return
+    active_runs = [entry for entry in routine_runs if entry[1]]
 
+    # Every routine gets its section, analyzed or not: the recap is posted
+    # on every run and its ticket counts are read as the state of all the
+    # routines. Until 2026-11-26 a routine with no task was left out (and
+    # with no task in any routine there was no recap at all), so its open
+    # tickets vanished from the message (UM, after its build of 11-24 was
+    # discarded).
     section1 = []
-    for entry in active_runs:
+    for entry in routine_runs:
         routine, task_id = entry[0], entry[1]
         summary = entry[2] if len(entry) > 2 else None
-        discarded = summary if summary and summary.get("abandoned") else None
-        section1.extend(_format_routine_block(routine, task_id, discarded))
+        if task_id:
+            discarded = summary if summary and summary.get("abandoned") else None
+            section1.extend(_format_routine_block(routine, task_id, discarded))
+        else:
+            section1.extend(
+                _format_routine_block(
+                    routine, None, not_analyzed=_not_analyzed_sentence(
+                        routine, summary
+                    )
+                )
+            )
 
     # A discarded build (--abandon) gets its own opening: the usual one says
     # the analysis ran and new tickets are ready, which is not true then.
     discarded_runs = [
         e for e in active_runs if len(e) > 2 and e[2] and e[2].get("abandoned")
     ]
-    if len(discarded_runs) == len(active_runs):
+    if not active_runs:
+        intro = (
+            "No routine build was analyzed in this run, so no tickets were "
+            "opened or closed. The open tickets are listed below."
+        )
+    elif len(discarded_runs) == len(active_runs):
         intro = (
             "The latest routine builds were discarded because of CI issues, "
             "so no analysis was done and no new tickets were opened. Tickets "
@@ -401,15 +457,19 @@ def print_slack_summary(
     print(separator)
 
 
-def _format_routine_block(routine, task_id, discarded=None):
+def _format_routine_block(routine, task_id, discarded=None, not_analyzed=None):
     """Build the lines that describe one routine inside the summary.
 
     `discarded` is the closure summary of a build discarded with --abandon:
     the task link is replaced by the build link (an abandoned task has no
     testflow to open) and by what was done instead of the analysis.
+    `not_analyzed` is the sentence printed instead of the task link when
+    the routine has no task in this run (see _not_analyzed_sentence).
     """
     routine_label = routine["routine_label"]
-    if discarded:
+    if not_analyzed:
+        lines = [f"{routine['name']}", not_analyzed]
+    elif discarded:
         build_id = discarded["build_id"]
         lines = [
             f"{routine['name']}",
@@ -454,6 +514,19 @@ def _format_routine_block(routine, task_id, discarded=None):
 
     lines.append("")
     return lines
+
+
+def _not_analyzed_sentence(routine, summary):
+    """Why a routine has no task in this run, for its recap section."""
+    if summary and summary.get("blocked"):
+        return (
+            f"Latest build not analyzed yet, out of scale "
+            f"({format_health(summary)}), waiting for a decision: "
+            f"{testray_build_url(summary['build_id'], routine['id'])}"
+        )
+    if summary and summary.get("no_task"):
+        return summary["no_task"]
+    return "No build analyzed in this run."
 
 
 def _format_ticket_count(jql):
@@ -1167,8 +1240,10 @@ def _close_tickets_passed_in_build(build_id, health):
 def _prepare_task(latest_build):
     """
     Ensure a task exists for latest_build and is actionable.
-    Returns (task_id or None, latest_build_id, complete_task_id or None);
-    complete_task_id is set only when the build's task is already COMPLETE.
+    Returns (task_id or None, latest_build_id, complete_task_id or None,
+    abandoned_task_id or None); complete_task_id is set only when the
+    build's task is already COMPLETE, abandoned_task_id only when it was
+    ABANDONED (a build discarded with --abandon on an earlier run).
     """
     latest_build_id = latest_build["id"]
     build_to_tasks = get_build_tasks(latest_build_id)
@@ -1179,20 +1254,20 @@ def _prepare_task(latest_build):
                 f"[DRY RUN] No task exists for build '{latest_build['name']}'. "
                 "Skipping task/testflow creation and subsequent processing."
             )
-            return None, latest_build_id, None
+            return None, latest_build_id, None, None
         print(
             f"[CREATE] No tasks for build '{latest_build['name']}', creating task and testflow."
         )
         task = create_task(latest_build)
         create_testflow(task["id"])
         print(f"✔ Using build {latest_build_id} and task {task['id']}")
-        return task["id"], latest_build_id, None
+        return task["id"], latest_build_id, None, None
 
     for task in build_to_tasks:
         due_status_key = task.get("dueStatus", {}).get("key")
         if due_status_key == "ABANDONED":
             print(f"Task {task['id']} has been ABANDONED.")
-            return None, latest_build_id, None
+            return None, latest_build_id, None, task["id"]
 
         print(f"[USE] Using existing task {task['id']} with status {due_status_key}.")
         task_id = task["id"]
@@ -1202,12 +1277,12 @@ def _prepare_task(latest_build):
             print(
                 f"✔ Task {task_id} for build {latest_build_id} is now complete. No further processing required."
             )
-            return None, latest_build_id, task_id
+            return None, latest_build_id, task_id, None
 
         print(f"✔ Using build {latest_build_id} and task {task_id}")
-        return task_id, latest_build_id, None
+        return task_id, latest_build_id, None, None
 
-    return None, latest_build_id, None
+    return None, latest_build_id, None, None
 
 
 def _find_analyzable_build_for_dry_run(builds):

@@ -42,7 +42,7 @@ The routines run every other day, Acceptance every day on most of the same tests
 - **a P that turned into an F in the history**: place the suspect commit between the two SHAs (2026-11-19: LPD-116292, 11 passes before LPD-46122, red after).
 - **an open PR**: say what it changes and whether it closes the ticket. A PR under another key (a migration that removes the Poshi test) leaves the routine ticket open: the analyzer cannot prove a test that is no longer in the build, so it is closed by hand after the merge (2026-11-19: LPD-114527 and PR #8503, LPD-115317).
 
-Write a "Routine triage" comment only where the evidence changed the verdict or its confidence (Step 7 rules). Never close or link on Acceptance alone: a test green in Acceptance can be red in the routine on the same SHA (LPD-114527). On a day with no new routine build this is the whole triage: then go to Step 9.
+Write a "Routine triage" comment only where the evidence changed the verdict or its confidence (Step 7 rules). Never close or link on Acceptance alone: a test green in Acceptance can be red in the routine on the same SHA (LPD-114527). On a day with no new routine build this is the whole triage: then go to Step 8 (the Slack recap is given on every run) and Step 9.
 
 ### The CMS section of the log
 
@@ -208,7 +208,9 @@ Keep the "Closed. Not reproducible in SHA" prefix: `diagnose_closed_commerce_tic
 
 ## Step 8 — Slack
 
-Give the user the recap block from the log (between "Plain-text summary (copy-paste below)" and the closing dashes) unchanged: the user reads and edits it before posting. Offer, as a separate block, a short English "Triage" addendum: one line per verdict group with the ticket keys, plus the actions applied.
+Give the user the recap block from the log (between "Plain-text summary (copy-paste below)" and the closing dashes) unchanged: the user reads and edits it before posting. Give it on every run, also with no new build or a discarded one: the team reads it as the state of the open tickets (Andrea, 2026-11-26: "il messaggio slack mettimelo sempre comunque, con i numeri giusti").
+
+Check the numbers before handing it over: every routine in `ANALYZED_ROUTINES` has its section, and each count matches Jira (`labels = "<routine_label>" AND statusCategory != Done`, per component). The counts are taken when the recap is printed: if tickets were closed or opened after it (Step 7 actions), say which counts changed and give the updated block. A routine missing from the recap is a script gap (2026-11-26: UM left out after its build was discarded the day before, fixed in `analyze_testflow`): add its section by hand in the same format and say so. Offer, as a separate block, a short English "Triage" addendum: one line per verdict group with the ticket keys, plus the actions applied.
 
 ## Step 9 — Close
 
